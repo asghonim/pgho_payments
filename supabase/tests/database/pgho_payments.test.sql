@@ -1,7 +1,5 @@
 BEGIN;
 
-CREATE SCHEMA IF NOT EXISTS pgho_payments;
-CREATE EXTENSION IF NOT EXISTS pgho_payments SCHEMA pgho_payments;
 SET search_path TO pgho_payments, public;
 
 SELECT plan(53);

@@ -1071,7 +1071,7 @@ BEGIN
         RAISE EXCEPTION 'create_order requires at least one item' USING ERRCODE = '22023';
     END IF;
 
-    FOR v_item IN SELECT * FROM jsonb_array_elements(p_items) AS item
+    FOR v_item IN SELECT value AS item FROM jsonb_array_elements(p_items)
     LOOP
         v_price    := NULL;
         v_product  := NULL;
@@ -1563,7 +1563,7 @@ LANGUAGE sql
 SET search_path = @extschema@, pg_catalog
 AS $$
     UPDATE webhook_events
-    SET status     = CASE WHEN p_permanent THEN 'failed' ELSE 'pending' END,
+    SET status     = CASE WHEN p_permanent THEN 'failed'::webhook_event_status ELSE 'pending'::webhook_event_status END,
         last_error = p_error,
         claimed_at = NULL
     WHERE id = p_webhook_event_id;

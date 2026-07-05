@@ -682,7 +682,7 @@ BEGIN
         RAISE EXCEPTION 'post_transaction requires at least two entries' USING ERRCODE = '22023';
     END IF;
 
-    FOR v_row IN SELECT * FROM jsonb_array_elements(p_entries) AS e
+    FOR v_row IN SELECT e AS e FROM jsonb_array_elements(p_entries) AS e
     LOOP
         IF NOT (v_row.e ? 'account_id') OR NOT (v_row.e ? 'currency') OR NOT (v_row.e ? 'amount') THEN
             RAISE EXCEPTION 'each entry requires account_id, currency, and amount' USING ERRCODE = '22023';
@@ -1076,7 +1076,7 @@ BEGIN
         RAISE EXCEPTION 'create_order requires at least one item' USING ERRCODE = '22023';
     END IF;
 
-    FOR v_item IN SELECT * FROM jsonb_array_elements(p_items) AS item
+    FOR v_item IN SELECT value AS item FROM jsonb_array_elements(p_items)
     LOOP
         v_price    := NULL;
         v_product  := NULL;
@@ -1568,7 +1568,7 @@ LANGUAGE sql
 SET search_path = @extschema@, pg_catalog
 AS $$
     UPDATE webhook_events
-    SET status     = CASE WHEN p_permanent THEN 'failed' ELSE 'pending' END,
+    SET status     = CASE WHEN p_permanent THEN 'failed'::webhook_event_status ELSE 'pending'::webhook_event_status END,
         last_error = p_error,
         claimed_at = NULL
     WHERE id = p_webhook_event_id;
