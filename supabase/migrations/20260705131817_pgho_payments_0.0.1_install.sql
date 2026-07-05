@@ -4,6 +4,7 @@
 -- Comment: Ledger-first payments: double-entry ledger, wallets, catalog, orders, subscriptions
 -------------------------------------- Initial installation of version: 0.0.1
 select pgtle.install_extension('pgho_payments', '0.0.1', $comment_OpfSzTfcsO44GCGt$Ledger-first payments: double-entry ledger, wallets, catalog, orders, subscriptions$comment_OpfSzTfcsO44GCGt$, $sql_OpfSzTfcsO44GCGt$-- pgho_payments: ledger-first payments, wallets, catalog, orders, and subscriptions
+-- pgho_payments: ledger-first payments, wallets, catalog, orders, and subscriptions
 --
 -- Money is represented by an immutable double-entry ledger (ledger_accounts /
 -- ledger_transactions / ledger_entries); every other module -- wallets, orders, payment

@@ -677,7 +677,7 @@ BEGIN
         RAISE EXCEPTION 'post_transaction requires at least two entries' USING ERRCODE = '22023';
     END IF;
 
-    FOR v_row IN SELECT * FROM jsonb_array_elements(p_entries) AS e
+    FOR v_row IN SELECT e AS e FROM jsonb_array_elements(p_entries) AS e
     LOOP
         IF NOT (v_row.e ? 'account_id') OR NOT (v_row.e ? 'currency') OR NOT (v_row.e ? 'amount') THEN
             RAISE EXCEPTION 'each entry requires account_id, currency, and amount' USING ERRCODE = '22023';
