@@ -453,8 +453,10 @@ CREATE TRIGGER prices_immutable_content
     BEFORE UPDATE ON prices
     FOR EACH ROW EXECUTE FUNCTION prevent_price_content_mutation();
 
--- Orders are immutable snapshots: once placed, only status/updated_at may change, so an
--- order always reflects exactly the totals/items agreed at purchase time.
+-- Orders are immutable snapshots: once placed, only status/updated_at/metadata may change,
+-- so an order always reflects exactly the totals/items agreed at purchase time, while still
+-- allowing applications to attach post-creation context (tracking numbers, fulfillment
+-- notes, external sync IDs) the same way prices/payment_intents/refunds/subscriptions do.
 CREATE OR REPLACE FUNCTION prevent_order_content_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -465,11 +467,10 @@ BEGIN
        OR NEW.currency        IS DISTINCT FROM OLD.currency
        OR NEW.subtotal_amount IS DISTINCT FROM OLD.subtotal_amount
        OR NEW.total_amount    IS DISTINCT FROM OLD.total_amount
-       OR NEW.metadata        IS DISTINCT FROM OLD.metadata
        OR NEW.idempotency_key IS DISTINCT FROM OLD.idempotency_key
        OR NEW.created_at      IS DISTINCT FROM OLD.created_at
     THEN
-        RAISE EXCEPTION 'orders content is immutable once placed; only status may change'
+        RAISE EXCEPTION 'orders content is immutable once placed; only status/updated_at/metadata may change'
             USING ERRCODE = '0A000';
     END IF;
     RETURN NEW;
@@ -610,15 +611,21 @@ LANGUAGE plpgsql
 SET search_path = @extschema@, pg_catalog
 AS $$
 BEGIN
+    -- Ensure the row exists, then lock it FOR UPDATE before computing the sum so
+    -- concurrent callers serialize on this account instead of racing to overwrite
+    -- each other's pre-lock sum with a stale value.
     INSERT INTO ledger_account_balances (account_id, currency, balance, updated_at)
-    VALUES (
-        p_account_id,
-        p_currency,
-        (SELECT coalesce(sum(amount), 0) FROM ledger_entries WHERE account_id = p_account_id AND currency = p_currency),
-        now()
-    )
-    ON CONFLICT (account_id, currency)
-    DO UPDATE SET balance = EXCLUDED.balance, updated_at = now();
+    VALUES (p_account_id, p_currency, 0, now())
+    ON CONFLICT (account_id, currency) DO NOTHING;
+
+    PERFORM 1 FROM ledger_account_balances
+    WHERE account_id = p_account_id AND currency = p_currency
+    FOR UPDATE;
+
+    UPDATE ledger_account_balances
+    SET balance = (SELECT coalesce(sum(amount), 0) FROM ledger_entries WHERE account_id = p_account_id AND currency = p_currency),
+        updated_at = now()
+    WHERE account_id = p_account_id AND currency = p_currency;
 END;
 $$;
 
@@ -708,9 +715,17 @@ BEGIN
             USING ERRCODE = '22023';
     END IF;
 
-    INSERT INTO ledger_transactions (tenant_id, type, reference_type, reference_id, description, metadata, idempotency_key, created_by)
-    VALUES (p_tenant_id, p_type, p_reference_type, p_reference_id, p_description, coalesce(p_metadata, '{}'), p_idempotency_key, p_created_by)
-    RETURNING id INTO v_transaction_id;
+    -- A concurrent caller may insert the same idempotency_key between our pre-check above
+    -- and this insert; catch the resulting unique_violation and return the winner's
+    -- transaction id instead of raising, so the idempotency contract holds under a race.
+    BEGIN
+        INSERT INTO ledger_transactions (tenant_id, type, reference_type, reference_id, description, metadata, idempotency_key, created_by)
+        VALUES (p_tenant_id, p_type, p_reference_type, p_reference_id, p_description, coalesce(p_metadata, '{}'), p_idempotency_key, p_created_by)
+        RETURNING id INTO v_transaction_id;
+    EXCEPTION WHEN unique_violation THEN
+        SELECT id INTO v_transaction_id FROM ledger_transactions WHERE idempotency_key = p_idempotency_key;
+        RETURN v_transaction_id;
+    END;
 
     INSERT INTO ledger_entries (transaction_id, account_id, currency, amount)
     SELECT v_transaction_id, (e->>'account_id')::bigint, e->>'currency', (e->>'amount')::bigint
@@ -745,6 +760,13 @@ AS $$
 DECLARE
     v_account_id bigint;
 BEGIN
+    -- There is no unique constraint on (tenant_id, owner_type, account_type) for system
+    -- accounts, so without serializing here two concurrent callers can both miss the
+    -- SELECT below and each create their own account. Take a transaction-scoped advisory
+    -- lock keyed on (tenant_id, account_type) so concurrent callers queue up and the
+    -- second one observes the first's row instead of creating a duplicate.
+    PERFORM pg_advisory_xact_lock(hashtextextended('get_or_create_system_account:' || coalesce(p_tenant_id, '') || ':' || p_account_type, 0));
+
     SELECT id INTO v_account_id
     FROM ledger_accounts
     WHERE owner_type = 'system'
@@ -854,7 +876,10 @@ BEGIN
         RAISE EXCEPTION 'withdrawal amount must be positive' USING ERRCODE = '22023';
     END IF;
 
-    SELECT * INTO v_wallet FROM wallets WHERE id = p_wallet_id;
+    -- Lock the wallet row before checking the balance so concurrent withdrawals against
+    -- the same wallet serialize: the second waiter re-reads the balance (post-lock) after
+    -- the first has committed its debit, instead of both passing the check off a stale read.
+    SELECT * INTO v_wallet FROM wallets WHERE id = p_wallet_id FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'wallet % not found', p_wallet_id USING ERRCODE = 'P0002';
     END IF;
@@ -911,7 +936,10 @@ BEGIN
         RAISE EXCEPTION 'cannot transfer a wallet to itself' USING ERRCODE = '22023';
     END IF;
 
-    SELECT * INTO v_from FROM wallets WHERE id = p_from_wallet_id;
+    -- Lock the source wallet before checking its balance, same as wallet_withdraw, so a
+    -- concurrent transfer/withdrawal debiting the same source wallet can't both pass the
+    -- balance check off a stale pre-lock read and overspend it.
+    SELECT * INTO v_from FROM wallets WHERE id = p_from_wallet_id FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'wallet % not found', p_from_wallet_id USING ERRCODE = 'P0002';
     END IF;
@@ -1104,6 +1132,9 @@ BEGIN
                 RAISE EXCEPTION 'item requires either price_id or unit_amount' USING ERRCODE = '22023';
             END IF;
             v_unit := (v_item.item->>'unit_amount')::bigint;
+            IF v_unit < 0 THEN
+                RAISE EXCEPTION 'item unit_amount must not be negative' USING ERRCODE = '22023';
+            END IF;
             v_desc := v_item.item->>'description';
         END IF;
 
@@ -1124,9 +1155,17 @@ BEGIN
         ));
     END LOOP;
 
-    INSERT INTO orders (tenant_id, customer_id, currency, subtotal_amount, total_amount, metadata, idempotency_key)
-    VALUES (p_tenant_id, p_customer_id, p_currency, v_subtotal, v_subtotal, coalesce(p_metadata, '{}'), p_idempotency_key)
-    RETURNING id INTO v_order_id;
+    -- A concurrent caller may insert the same idempotency_key between our pre-check above
+    -- and this insert; catch the resulting unique_violation and return the winner's order
+    -- id instead of raising, so the idempotency contract holds under a race.
+    BEGIN
+        INSERT INTO orders (tenant_id, customer_id, currency, subtotal_amount, total_amount, metadata, idempotency_key)
+        VALUES (p_tenant_id, p_customer_id, p_currency, v_subtotal, v_subtotal, coalesce(p_metadata, '{}'), p_idempotency_key)
+        RETURNING id INTO v_order_id;
+    EXCEPTION WHEN unique_violation THEN
+        SELECT id INTO v_order_id FROM orders WHERE idempotency_key = p_idempotency_key;
+        RETURN v_order_id;
+    END;
 
     INSERT INTO order_items (order_id, product_id, price_id, description, unit_amount, quantity, amount_total, currency)
     SELECT
@@ -1204,9 +1243,17 @@ BEGIN
         RAISE EXCEPTION 'order % not found', p_order_id USING ERRCODE = 'P0002';
     END IF;
 
-    INSERT INTO payment_intents (tenant_id, order_id, provider, currency, amount, metadata, idempotency_key)
-    VALUES (p_tenant_id, p_order_id, p_provider, p_currency, p_amount, coalesce(p_metadata, '{}'), p_idempotency_key)
-    RETURNING id INTO v_payment_intent_id;
+    -- A concurrent caller may insert the same idempotency_key between our pre-check above
+    -- and this insert; catch the resulting unique_violation and return the winner's
+    -- payment_intent id instead of raising, so the idempotency contract holds under a race.
+    BEGIN
+        INSERT INTO payment_intents (tenant_id, order_id, provider, currency, amount, metadata, idempotency_key)
+        VALUES (p_tenant_id, p_order_id, p_provider, p_currency, p_amount, coalesce(p_metadata, '{}'), p_idempotency_key)
+        RETURNING id INTO v_payment_intent_id;
+    EXCEPTION WHEN unique_violation THEN
+        SELECT id INTO v_payment_intent_id FROM payment_intents WHERE idempotency_key = p_idempotency_key;
+        RETURN v_payment_intent_id;
+    END;
 
     RETURN v_payment_intent_id;
 END;
@@ -1341,7 +1388,11 @@ BEGIN
         END IF;
     END IF;
 
-    SELECT * INTO v_intent FROM payment_intents WHERE id = p_payment_intent_id;
+    -- Lock the payment_intent before checking the already-refunded total so concurrent
+    -- refund requests against the same intent serialize: the second waiter re-reads the
+    -- refunded total (post-lock) after the first has committed, instead of both passing
+    -- the limit check off a stale read and together exceeding the intent's amount.
+    SELECT * INTO v_intent FROM payment_intents WHERE id = p_payment_intent_id FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'payment_intent % not found', p_payment_intent_id USING ERRCODE = 'P0002';
     END IF;
@@ -1363,9 +1414,17 @@ BEGIN
             v_amount, p_payment_intent_id, v_intent.amount, v_already_refunded USING ERRCODE = '23514';
     END IF;
 
-    INSERT INTO refunds (tenant_id, payment_intent_id, provider, currency, amount, reason, idempotency_key)
-    VALUES (v_intent.tenant_id, p_payment_intent_id, v_intent.provider, v_intent.currency, v_amount, p_reason, p_idempotency_key)
-    RETURNING id INTO v_refund_id;
+    -- A concurrent caller may insert the same idempotency_key between our pre-check above
+    -- and this insert; catch the resulting unique_violation and return the winner's
+    -- refund id instead of raising, so the idempotency contract holds under a race.
+    BEGIN
+        INSERT INTO refunds (tenant_id, payment_intent_id, provider, currency, amount, reason, idempotency_key)
+        VALUES (v_intent.tenant_id, p_payment_intent_id, v_intent.provider, v_intent.currency, v_amount, p_reason, p_idempotency_key)
+        RETURNING id INTO v_refund_id;
+    EXCEPTION WHEN unique_violation THEN
+        SELECT id INTO v_refund_id FROM refunds WHERE idempotency_key = p_idempotency_key;
+        RETURN v_refund_id;
+    END;
 
     RETURN v_refund_id;
 END;
@@ -1509,6 +1568,9 @@ BEGIN
     IF p_provider_event_id IS NULL OR trim(p_provider_event_id) = '' THEN
         RAISE EXCEPTION 'provider_event_id is required' USING ERRCODE = '22023';
     END IF;
+    IF p_event_type IS NULL OR trim(p_event_type) = '' THEN
+        RAISE EXCEPTION 'event_type is required' USING ERRCODE = '22023';
+    END IF;
 
     INSERT INTO webhook_events (provider, event_type, provider_event_id, payload)
     VALUES (p_provider, p_event_type, p_provider_event_id, coalesce(p_payload, '{}'))
@@ -1524,10 +1586,13 @@ END;
 $$;
 
 -- FOR UPDATE SKIP LOCKED lets multiple workers claim disjoint batches concurrently; mirrors
--- pgho_outbox's claim_deliveries().
+-- pgho_outbox's claim_deliveries(). Also reclaims events stuck in 'processing' for too long
+-- (worker crashed/restarted mid-processing without ever calling mark_webhook_event_processed
+-- or mark_webhook_event_failed), so a dead worker can't strand events forever.
 CREATE OR REPLACE FUNCTION claim_webhook_events(
-    p_limit    integer DEFAULT 10,
-    p_provider text    DEFAULT NULL
+    p_limit            integer DEFAULT 10,
+    p_provider         text    DEFAULT NULL,
+    p_stuck_after      interval DEFAULT interval '15 minutes'
 )
 RETURNS SETOF webhook_events
 LANGUAGE plpgsql
@@ -1539,8 +1604,11 @@ BEGIN
     SET status = 'processing', claimed_at = now(), attempts = attempts + 1
     WHERE id IN (
         SELECT id FROM webhook_events
-        WHERE status = 'pending'
-          AND (p_provider IS NULL OR provider = p_provider)
+        WHERE (p_provider IS NULL OR provider = p_provider)
+          AND (
+            status = 'pending'
+            OR (status = 'processing' AND claimed_at < now() - p_stuck_after)
+          )
         ORDER BY received_at
         LIMIT p_limit
         FOR UPDATE SKIP LOCKED
@@ -1569,9 +1637,11 @@ LANGUAGE sql
 SET search_path = @extschema@, pg_catalog
 AS $$
     UPDATE webhook_events
-    SET status     = CASE WHEN p_permanent THEN 'failed'::webhook_event_status ELSE 'pending'::webhook_event_status END,
-        last_error = p_error,
-        claimed_at = NULL
+    SET status       = CASE WHEN p_permanent THEN 'failed'::webhook_event_status ELSE 'pending'::webhook_event_status END,
+        last_error   = p_error,
+        claimed_at   = NULL,
+        processed_at = NULL,
+        failed_at    = CASE WHEN p_permanent THEN now() ELSE NULL END
     WHERE id = p_webhook_event_id;
 $$;
 
@@ -1622,6 +1692,9 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION 'price % not found', p_price_id USING ERRCODE = 'P0002';
     END IF;
+    IF NOT v_price.active THEN
+        RAISE EXCEPTION 'price % is not active', p_price_id USING ERRCODE = '55000';
+    END IF;
     IF v_price.type <> 'recurring' THEN
         RAISE EXCEPTION 'price % is not recurring; subscriptions require a recurring price', p_price_id USING ERRCODE = '22023';
     END IF;
@@ -1634,15 +1707,23 @@ BEGIN
         v_period_end := compute_period_end(v_now, v_price.billing_interval, v_price.interval_count);
     END IF;
 
-    INSERT INTO subscriptions (
-        tenant_id, customer_id, price_id, status,
-        current_period_start, current_period_end, trial_end, metadata, idempotency_key
-    )
-    VALUES (
-        p_tenant_id, p_customer_id, p_price_id, v_status,
-        v_now, v_period_end, p_trial_end, coalesce(p_metadata, '{}'), p_idempotency_key
-    )
-    RETURNING id INTO v_subscription_id;
+    -- A concurrent caller may insert the same idempotency_key between our pre-check above
+    -- and this insert; catch the resulting unique_violation and return the winner's
+    -- subscription id instead of raising, so the idempotency contract holds under a race.
+    BEGIN
+        INSERT INTO subscriptions (
+            tenant_id, customer_id, price_id, status,
+            current_period_start, current_period_end, trial_end, metadata, idempotency_key
+        )
+        VALUES (
+            p_tenant_id, p_customer_id, p_price_id, v_status,
+            v_now, v_period_end, p_trial_end, coalesce(p_metadata, '{}'), p_idempotency_key
+        )
+        RETURNING id INTO v_subscription_id;
+    EXCEPTION WHEN unique_violation THEN
+        SELECT id INTO v_subscription_id FROM subscriptions WHERE idempotency_key = p_idempotency_key;
+        RETURN v_subscription_id;
+    END;
 
     INSERT INTO subscription_events (subscription_id, type, payload)
     VALUES (v_subscription_id, 'created', jsonb_build_object('price_id', p_price_id, 'status', v_status));
@@ -1772,6 +1853,9 @@ BEGIN
     SELECT * INTO v_new_price FROM prices WHERE id = p_new_price_id;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'price % not found', p_new_price_id USING ERRCODE = 'P0002';
+    END IF;
+    IF NOT v_new_price.active THEN
+        RAISE EXCEPTION 'price % is not active', p_new_price_id USING ERRCODE = '55000';
     END IF;
     IF v_new_price.type <> 'recurring' THEN
         RAISE EXCEPTION 'price % is not recurring; subscriptions require a recurring price', p_new_price_id USING ERRCODE = '22023';
