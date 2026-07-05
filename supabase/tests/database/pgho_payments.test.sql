@@ -2,7 +2,17 @@ BEGIN;
 
 SET search_path TO pgho_payments, public;
 
-SELECT plan(53);
+SELECT plan(71);
+
+-- ==============================
+-- EXTENSION METADATA
+-- ==============================
+
+SELECT is(
+    (SELECT extrelocatable FROM pg_extension WHERE extname = 'pgho_payments'),
+    false,
+    'pgho_payments is not relocatable, since @extschema@ is baked into function search_paths'
+);
 
 -- ==============================
 -- LEDGER: post_transaction
@@ -84,6 +94,15 @@ SELECT throws_ok(
     '0A000',
     NULL,
     'ledger_accounts identity is immutable once created'
+);
+
+SELECT get_or_create_system_account('fees', 'test') AS sys_acct_1 \gset
+SELECT get_or_create_system_account('fees', 'test') AS sys_acct_2 \gset
+
+SELECT is(
+    :'sys_acct_1'::bigint,
+    :'sys_acct_2'::bigint,
+    'get_or_create_system_account is idempotent per (tenant_id, account_type) and never creates a duplicate'
 );
 
 -- ==============================
@@ -207,6 +226,18 @@ SELECT throws_ok(
     'orders content is immutable once placed'
 );
 
+SELECT lives_ok(
+    format($fmt$ UPDATE orders SET metadata = '{"note":"post-placement"}'::jsonb WHERE id = '%s'::uuid $fmt$, :'order_id'),
+    'orders metadata remains mutable after placement, unlike the other content fields'
+);
+
+SELECT throws_ok(
+    $$ SELECT create_order('customer-1', 'USD', jsonb_build_array(jsonb_build_object('unit_amount', -100, 'quantity', 1))) $$,
+    '22023',
+    NULL,
+    'create_order rejects a negative unit_amount on an ad hoc item'
+);
+
 SELECT create_order(
     'customer-2', 'USD',
     jsonb_build_array(jsonb_build_object('unit_amount', 500, 'quantity', 1)),
@@ -239,6 +270,11 @@ SELECT throws_ok(
 
 SELECT create_payment_intent('stripe', 'USD', 3100, :'order_id'::uuid) AS intent_id \gset
 
+SELECT create_payment_intent('stripe', 'USD', 500, p_idempotency_key := 'intent-idem-1') AS idem_intent_1 \gset
+SELECT create_payment_intent('stripe', 'USD', 500, p_idempotency_key := 'intent-idem-1') AS idem_intent_2 \gset
+
+SELECT is(:'idem_intent_1'::uuid, :'idem_intent_2'::uuid, 'create_payment_intent with a repeated idempotency_key returns the original intent id');
+
 SELECT throws_ok(
     format($fmt$ UPDATE payment_intents SET amount = 1 WHERE id = '%s'::uuid $fmt$, :'intent_id'),
     '0A000',
@@ -266,6 +302,19 @@ SELECT throws_ok(
     'create_refund rejects a further refund once the intent is fully refunded'
 );
 
+SELECT mark_payment_intent_succeeded(:'idem_intent_1'::uuid);
+
+SELECT create_refund(:'idem_intent_1'::uuid, 100, p_idempotency_key := 'refund-idem-1') AS idem_refund_1 \gset
+SELECT create_refund(:'idem_intent_1'::uuid, 100, p_idempotency_key := 'refund-idem-1') AS idem_refund_2 \gset
+
+SELECT is(:'idem_refund_1'::uuid, :'idem_refund_2'::uuid, 'create_refund with a repeated idempotency_key returns the original refund id');
+
+SELECT is(
+    (SELECT coalesce(sum(amount), 0)::bigint FROM refunds WHERE payment_intent_id = :'idem_intent_1'::uuid),
+    100::bigint,
+    'a repeated idempotency_key does not double-refund'
+);
+
 SELECT lives_ok(
     format($fmt$ SELECT mark_refund_succeeded('%s'::uuid) $fmt$, :'refund_id'),
     'mark_refund_succeeded runs without error'
@@ -280,6 +329,20 @@ SELECT is(
 -- ==============================
 -- WEBHOOKS: WORKER API
 -- ==============================
+
+SELECT throws_ok(
+    $$ SELECT record_webhook_event('stripe', NULL, 'evt_missing_type', '{}'::jsonb) $$,
+    '22023',
+    NULL,
+    'record_webhook_event rejects a null event_type instead of surfacing a raw not_null_violation'
+);
+
+SELECT throws_ok(
+    $$ SELECT record_webhook_event('stripe', '', 'evt_missing_type', '{}'::jsonb) $$,
+    '22023',
+    NULL,
+    'record_webhook_event rejects an empty event_type'
+);
 
 SELECT record_webhook_event('stripe', 'payment_intent.succeeded', 'evt_1', '{"foo":"bar"}'::jsonb) AS webhook_id_1 \gset
 SELECT record_webhook_event('stripe', 'payment_intent.succeeded', 'evt_1', '{"foo":"bar"}'::jsonb) AS webhook_id_2 \gset
@@ -322,15 +385,83 @@ SELECT is(
     'mark_webhook_event_failed requeues a non-permanent failure back to pending'
 );
 
+-- Finalize webhook_id_3 so it doesn't linger as 'pending' and get swept up by the
+-- claim_webhook_events assertions further down.
+SELECT mark_webhook_event_failed(:'webhook_id_3'::uuid, 'giving up', true);
+
+SELECT record_webhook_event('stripe', 'charge.failed', 'evt_permanent', '{}'::jsonb) AS webhook_id_4 \gset
+SELECT lives_ok(
+    format($fmt$ SELECT mark_webhook_event_failed('%s'::uuid, 'boom', true) $fmt$, :'webhook_id_4'),
+    'mark_webhook_event_failed(permanent := true) runs without error'
+);
+
+SELECT is(
+    (SELECT status::text FROM webhook_events WHERE id = :'webhook_id_4'::uuid),
+    'failed',
+    'mark_webhook_event_failed(permanent := true) marks the event failed'
+);
+
+SELECT is(
+    (SELECT failed_at IS NOT NULL FROM webhook_events WHERE id = :'webhook_id_4'::uuid),
+    true,
+    'mark_webhook_event_failed(permanent := true) records failed_at for observability'
+);
+
+SELECT record_webhook_event('stripe', 'charge.failed', 'evt_stuck', '{}'::jsonb) AS webhook_id_5 \gset
+
+SELECT is(
+    (SELECT count(*)::int FROM claim_webhook_events(10, 'stripe')),
+    1,
+    'claim_webhook_events claims the stuck-test webhook event'
+);
+
+SELECT is(
+    (SELECT count(*)::int FROM claim_webhook_events(10, 'stripe')),
+    0,
+    'claim_webhook_events does not reclaim a processing event that was claimed moments ago'
+);
+
+UPDATE webhook_events SET claimed_at = now() - interval '1 hour' WHERE id = :'webhook_id_5'::uuid;
+
+SELECT is(
+    (SELECT count(*)::int FROM claim_webhook_events(10, 'stripe')),
+    1,
+    'claim_webhook_events reclaims a webhook event stuck in processing past the stuck-after threshold, so a crashed worker cannot strand it forever'
+);
+
 -- ==============================
 -- SUBSCRIPTIONS API
 -- ==============================
 
+SELECT create_price(:'product_id'::uuid, 'USD', 900) AS active_onetime_price_id \gset
+
 SELECT throws_ok(
-    format($fmt$ SELECT create_subscription('customer-3', '%s'::uuid) $fmt$, :'onetime_price_id'),
+    format($fmt$ SELECT create_subscription('customer-3', '%s'::uuid) $fmt$, :'active_onetime_price_id'),
     '22023',
     NULL,
     'create_subscription rejects a non-recurring price'
+);
+
+SELECT create_price(:'product_id'::uuid, 'USD', 2000, 'recurring', 'month') AS inactive_monthly_price_id \gset
+SELECT deactivate_price(:'inactive_monthly_price_id'::uuid);
+
+SELECT throws_ok(
+    format($fmt$ SELECT create_subscription('customer-3', '%s'::uuid) $fmt$, :'inactive_monthly_price_id'),
+    '55000',
+    NULL,
+    'create_subscription rejects an inactive price'
+);
+
+SELECT create_subscription('customer-3', :'monthly_price_id'::uuid, p_idempotency_key := 'sub-idem-1') AS idem_sub_1 \gset
+SELECT create_subscription('customer-3', :'monthly_price_id'::uuid, p_idempotency_key := 'sub-idem-1') AS idem_sub_2 \gset
+
+SELECT is(:'idem_sub_1'::uuid, :'idem_sub_2'::uuid, 'create_subscription with a repeated idempotency_key returns the original subscription id');
+
+SELECT throws_ok(
+    format($fmt$ SELECT change_subscription_price('%s'::uuid, '%s'::uuid) $fmt$, :'idem_sub_1', :'inactive_monthly_price_id'),
+    '55000',
+    NULL,
+    'change_subscription_price rejects switching to an inactive price'
 );
 
 SELECT create_subscription('customer-3', :'monthly_price_id'::uuid) AS subscription_id \gset

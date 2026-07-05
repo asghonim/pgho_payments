@@ -1,8 +1,8 @@
 default_version = '0.0.1'
 comment = 'Ledger-first payments: double-entry ledger, wallets, catalog, orders, subscriptions'
-relocatable = true
-# Note: the script bakes @extschema@ into every function's SET search_path and into
-# COMMENT ON statements, substituted once at install time. If this extension is ever
-# relocated via ALTER EXTENSION ... SET SCHEMA, those pinned search_path values will still
-# point at the old schema name and functions will stop finding their own tables. Only
-# relocate an installed instance if you immediately recreate it instead of moving it in place.
+relocatable = false
+# The script bakes @extschema@ into every function's SET search_path and into
+# COMMENT ON statements, substituted once at install time. If this extension were
+# relocated via ALTER EXTENSION ... SET SCHEMA, those pinned search_path values would still
+# point at the old schema name and functions would stop finding their own tables. Marking
+# the extension non-relocatable makes Postgres reject that command outright.
