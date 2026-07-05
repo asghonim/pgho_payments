@@ -6,8 +6,12 @@ start:
 test:
     supabase test db
 
-# Regenerate supabase/migrations/*_pgho_payments.sql after editing pgho_payments--0.0.1.sql,
-# then reset the local Supabase database to pick it up.
-regenerate:
-    dbdev add --output-path supabase/migrations --schema pgho_payments path --directory .
+install:
+    dbdev install --connection postgresql://postgres:postgres@host.docker.internal:54322/postgres path --directory .
+
+# Regenerate supabase/migrations/*_pgho_payments.sql after editing pgho_payments--0.0.1.sql
+add:
+    dbdev add --output-path supabase/migrations --schema pgho_payments --connection postgresql://postgres:postgres@host.docker.internal:54322/postgres path --directory .
+
+reset:
     supabase db reset
