@@ -792,11 +792,36 @@ DECLARE
     v_wallet_id         uuid;
     v_ledger_account_id bigint;
 BEGIN
+    SELECT id INTO v_wallet_id
+    FROM wallets
+    WHERE tenant_id IS NOT DISTINCT FROM p_tenant_id
+      AND owner_type = p_owner_type
+      AND owner_id = p_owner_id
+      AND wallet_type = coalesce(p_wallet_type, 'main');
+    IF FOUND THEN
+        RETURN v_wallet_id;
+    END IF;
+
     v_ledger_account_id := create_ledger_account(p_owner_type, p_owner_id, 'wallet', p_tenant_id, p_wallet_type);
 
-    INSERT INTO wallets (tenant_id, owner_type, owner_id, wallet_type, ledger_account_id, default_currency, metadata)
-    VALUES (p_tenant_id, p_owner_type, p_owner_id, coalesce(p_wallet_type, 'main'), v_ledger_account_id, p_default_currency, coalesce(p_metadata, '{}'))
-    RETURNING id INTO v_wallet_id;
+    -- A concurrent caller may insert the same (tenant_id, owner_type, owner_id, wallet_type)
+    -- between our pre-check above and this insert; on unique_violation, delete the ledger
+    -- account we just created so it doesn't leak as an orphan, and return the winner's
+    -- wallet id instead of raising.
+    BEGIN
+        INSERT INTO wallets (tenant_id, owner_type, owner_id, wallet_type, ledger_account_id, default_currency, metadata)
+        VALUES (p_tenant_id, p_owner_type, p_owner_id, coalesce(p_wallet_type, 'main'), v_ledger_account_id, p_default_currency, coalesce(p_metadata, '{}'))
+        RETURNING id INTO v_wallet_id;
+    EXCEPTION WHEN unique_violation THEN
+        DELETE FROM ledger_accounts WHERE id = v_ledger_account_id;
+        SELECT id INTO v_wallet_id
+        FROM wallets
+        WHERE tenant_id IS NOT DISTINCT FROM p_tenant_id
+          AND owner_type = p_owner_type
+          AND owner_id = p_owner_id
+          AND wallet_type = coalesce(p_wallet_type, 'main');
+        RETURN v_wallet_id;
+    END;
 
     RETURN v_wallet_id;
 END;

@@ -21,9 +21,9 @@ jobs:
         with:
           node-version: '24.x'
 
-      # Step 3: Install the dbdev CLI globally
+      # Step 3: Install the dbdev CLI globally, pinned to the same version as the devcontainer
       - name: Install dbdev CLI
-        run: npm install -g @supabase/dbdev
+        run: npm install -g @supabase/dbdev@0.1.7
 
       # Step 4: Publish the package using the stored token
       - name: Publish to dbdev

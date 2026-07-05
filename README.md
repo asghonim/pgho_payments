@@ -110,12 +110,13 @@ constraints alone.
 
 ### A note on relocating the extension
 
-`pgho_payments.control` sets `relocatable = true`, but every function pins
-`SET search_path = @extschema@, pg_catalog`, substituted once at install time. If you ever
-run `ALTER EXTENSION pgho_payments SET SCHEMA ...`, the tables move but each function's
-pinned search_path still points at the old schema name, so functions will stop finding
-their own tables. Don't relocate an installed instance in place -- drop and recreate it
-in the new schema instead.
+`pgho_payments.control` sets `relocatable = false`, because every function pins
+`SET search_path = @extschema@, pg_catalog`, substituted once at install time. If the
+extension were relocated via `ALTER EXTENSION pgho_payments SET SCHEMA ...`, the tables
+would move but each function's pinned search_path would still point at the old schema
+name, so functions would stop finding their own tables. Postgres rejects that command
+outright for a non-relocatable extension; to move an installed instance, drop and recreate
+it in the new schema instead.
 
 ## Usage
 

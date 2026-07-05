@@ -1,17 +1,17 @@
 {
   "name": "Awareness",
-  "image": "mcr.microsoft.com/devcontainers/base:latest",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
   "features": {
     "ghcr.io/devcontainers/features/github-cli:1": {
-      "version": "latest"
+      "version": "2.96.0"
     },
     "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
-      "version": "latest",
+      "version": "29.6.1",
       "moby": "false",
       "enableNonRootDocker": true
     },
     "ghcr.io/guiyomh/features/just": {
-      "version": "latest"
+      "version": "1.55.1"
     }
   },
   // Configure tool-specific properties.
