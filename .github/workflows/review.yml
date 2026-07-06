@@ -12,6 +12,14 @@ jobs:
     name: Claude Review
     runs-on: ubuntu-latest
     steps:
-      - name: Claude Code Action Official
-        uses: anthropics/claude-code-action@v1
-      
+       - name: Checkout Code
+         uses: actions/checkout@v4
+       
+       - name: Analyze PR
+         uses: anthropics/claude-code-action@v1
+         with:
+            # Providing a prompt tells the v1 action to run autonomously
+            prompt: |
+              Thoroughly review the code changes in this Pull Request. 
+              Identify performance bottlenecks, logic bugs, or security liabilities.
+              Leave concise markdown suggestions where applicable.
