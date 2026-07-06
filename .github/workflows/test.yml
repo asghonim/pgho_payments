@@ -1,0 +1,32 @@
+name: Test
+
+on:
+  pull_request:
+
+jobs:
+  test:
+    name: Database Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v4
+        with:
+          just-version: '1.46.0'
+      
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+
+      - name: Install dbdev CLI
+        run: npm install -g @supabase/dbdev@0.1.7
+      
+      - run: just start
+      - run: just install
+      - run: just add
+      - run: just migrate
+      - run: just test

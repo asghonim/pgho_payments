@@ -1,0 +1,32 @@
+name: Publish
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  publish:
+    environment: Production
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Check out the repository source code
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2: Set up a stable Node.js environment
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+
+      # Step 3: Install the dbdev CLI globally, pinned to the same version as the devcontainer
+      - name: Install dbdev CLI
+        run: npm install -g @supabase/dbdev@0.1.7
+
+      # Step 4: Publish the package using the stored token
+      - name: Publish to dbdev
+        env:
+          DBDEV_API_KEY: ${{ secrets.DBDEV_API_KEY }}
+        run: dbdev publish
