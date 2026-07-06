@@ -2,7 +2,7 @@ BEGIN;
 
 SET search_path TO pgho_payments, public;
 
-SELECT plan(71);
+SELECT plan(117);
 
 -- ==============================
 -- EXTENSION METADATA
@@ -508,6 +508,378 @@ SELECT is(
     (SELECT status::text FROM subscriptions WHERE id = :'subscription_id'::uuid),
     'cancelled',
     'renew_subscription finalizes the cancellation instead of billing another cycle'
+);
+
+-- ==============================
+-- FEATURES & ENTITLEMENTS
+-- ==============================
+
+SELECT is(
+    (SELECT is_addon FROM products WHERE id = :'product_id'::uuid),
+    false,
+    'create_product defaults is_addon to false'
+);
+
+SELECT create_feature('api_calls', 'API Calls', 'limit', p_unit := 'calls') AS api_calls_feature \gset
+SELECT create_feature('sso', 'SSO', 'boolean') AS sso_feature \gset
+
+SELECT set_price_entitlement(:'monthly_price_id'::uuid, 'api_calls', p_value_limit := 1000);
+SELECT set_price_entitlement(:'monthly_price_id'::uuid, 'sso', p_value_boolean := false);
+
+SELECT create_subscription('customer-4', :'monthly_price_id'::uuid) AS feature_sub_id \gset
+
+SELECT is(
+    (SELECT value_limit FROM check_feature_entitlement(:'feature_sub_id'::uuid, 'api_calls')),
+    1000::bigint,
+    'create_subscription recomputes entitlements from the plan price'
+);
+
+SELECT is(
+    (SELECT allowed FROM check_feature_entitlement(:'feature_sub_id'::uuid, 'sso')),
+    false,
+    'a boolean feature the plan sets false is not allowed'
+);
+
+INSERT INTO products (name, is_addon) VALUES ('Extra API Calls', true) RETURNING id AS addon_product_id \gset
+SELECT create_price(:'addon_product_id'::uuid, 'USD', 500, 'recurring', 'month') AS addon_price_id \gset
+SELECT set_price_entitlement(:'addon_price_id'::uuid, 'api_calls', p_value_limit := 5000);
+SELECT set_price_entitlement(:'addon_price_id'::uuid, 'sso', p_value_boolean := true);
+
+SELECT throws_ok(
+    format($fmt$ SELECT add_subscription_addon('%s'::uuid, '%s'::uuid) $fmt$, :'feature_sub_id', :'monthly_price_id'),
+    'P0002',
+    NULL,
+    'add_subscription_addon rejects a price whose product is not flagged is_addon'
+);
+
+SELECT add_subscription_addon(:'feature_sub_id'::uuid, :'addon_price_id'::uuid) AS feature_addon_id \gset
+
+SELECT is(
+    (SELECT value_limit FROM check_feature_entitlement(:'feature_sub_id'::uuid, 'api_calls')),
+    5000::bigint,
+    'an active addon entitlement merges with the plan entitlement, taking the larger limit'
+);
+
+SELECT is(
+    (SELECT allowed FROM check_feature_entitlement(:'feature_sub_id'::uuid, 'sso')),
+    true,
+    'a boolean feature is OR-merged across plan and addon, so the addon can turn it on'
+);
+
+SELECT remove_subscription_addon(:'feature_addon_id'::uuid);
+
+SELECT is(
+    (SELECT value_limit FROM check_feature_entitlement(:'feature_sub_id'::uuid, 'api_calls')),
+    1000::bigint,
+    'removing the addon recomputes entitlements back down to the plan-only value'
+);
+
+SELECT is(
+    (SELECT allowed FROM check_feature_entitlement(:'feature_sub_id'::uuid, 'sso')),
+    false,
+    'removing the addon also drops the boolean feature it had turned on'
+);
+
+-- ==============================
+-- SEATS, PAUSE/RESUME
+-- ==============================
+
+SELECT throws_ok(
+    format($fmt$ SELECT set_subscription_quantity('%s'::uuid, 0) $fmt$, :'feature_sub_id'),
+    '22023',
+    NULL,
+    'set_subscription_quantity rejects a non-positive quantity'
+);
+
+SELECT lives_ok(
+    format($fmt$ SELECT set_subscription_quantity('%s'::uuid, 5) $fmt$, :'feature_sub_id'),
+    'set_subscription_quantity accepts a positive quantity'
+);
+
+SELECT is(
+    (SELECT quantity FROM subscriptions WHERE id = :'feature_sub_id'::uuid),
+    5,
+    'set_subscription_quantity updates the subscription seat count'
+);
+
+SELECT lives_ok(
+    format($fmt$ SELECT pause_subscription('%s'::uuid) $fmt$, :'feature_sub_id'),
+    'pause_subscription runs without error on an active subscription'
+);
+
+SELECT is(
+    (SELECT status::text FROM subscriptions WHERE id = :'feature_sub_id'::uuid),
+    'paused',
+    'pause_subscription transitions the subscription to paused'
+);
+
+SELECT throws_ok(
+    format($fmt$ SELECT pause_subscription('%s'::uuid) $fmt$, :'feature_sub_id'),
+    '55000',
+    NULL,
+    'pause_subscription rejects a subscription that is already paused'
+);
+
+SELECT lives_ok(
+    format($fmt$ SELECT resume_subscription('%s'::uuid) $fmt$, :'feature_sub_id'),
+    'resume_subscription runs without error on a paused subscription'
+);
+
+SELECT is(
+    (SELECT status::text FROM subscriptions WHERE id = :'feature_sub_id'::uuid),
+    'active',
+    'resume_subscription transitions the subscription back to active'
+);
+
+SELECT throws_ok(
+    format($fmt$ SELECT resume_subscription('%s'::uuid) $fmt$, :'feature_sub_id'),
+    '55000',
+    NULL,
+    'resume_subscription rejects a subscription that is not paused'
+);
+
+-- ==============================
+-- SUBSCRIPTION CHANGE REQUESTS
+-- ==============================
+
+SELECT create_price(:'product_id'::uuid, 'USD', 3000, 'recurring', 'month') AS plan_price_v2 \gset
+
+SELECT create_subscription_change_request(
+    'customer-4', 'upgrade', :'feature_sub_id'::uuid, :'plan_price_v2'::uuid,
+    p_idempotency_key := 'change-req-idem-1'
+) AS change_request_1 \gset
+
+SELECT create_subscription_change_request(
+    'customer-4', 'upgrade', :'feature_sub_id'::uuid, :'plan_price_v2'::uuid,
+    p_idempotency_key := 'change-req-idem-1'
+) AS change_request_2 \gset
+
+SELECT is(
+    :'change_request_1'::uuid, :'change_request_2'::uuid,
+    'create_subscription_change_request with a repeated idempotency_key returns the original request id'
+);
+
+SELECT lives_ok(
+    format($fmt$ SELECT apply_subscription_change_request('%s'::uuid) $fmt$, :'change_request_1'),
+    'apply_subscription_change_request runs without error for a pending upgrade request'
+);
+
+SELECT is(
+    (SELECT price_id FROM subscriptions WHERE id = :'feature_sub_id'::uuid),
+    :'plan_price_v2'::uuid,
+    'apply_subscription_change_request dispatches an upgrade to change_subscription_price'
+);
+
+SELECT is(
+    (SELECT status::text FROM subscription_change_requests WHERE uid = :'change_request_1'::uuid),
+    'completed',
+    'apply_subscription_change_request marks the request completed on success'
+);
+
+SELECT throws_ok(
+    format($fmt$ SELECT apply_subscription_change_request('%s'::uuid) $fmt$, :'change_request_1'),
+    '55000',
+    NULL,
+    'apply_subscription_change_request rejects a request that is not pending/awaiting_payment'
+);
+
+SELECT create_subscription_change_request('customer-4', 'cancel', :'feature_sub_id'::uuid) AS change_request_3 \gset
+
+UPDATE subscription_change_requests SET expires_at = now() - interval '1 minute' WHERE uid = :'change_request_3'::uuid;
+
+SELECT is(
+    expire_subscription_change_requests(),
+    1,
+    'expire_subscription_change_requests expires exactly the one request past its expires_at'
+);
+
+SELECT is(
+    (SELECT status::text FROM subscription_change_requests WHERE uid = :'change_request_3'::uuid),
+    'expired',
+    'expire_subscription_change_requests marks the stale request expired'
+);
+
+SELECT throws_ok(
+    format($fmt$ SELECT apply_subscription_change_request('%s'::uuid) $fmt$, :'change_request_3'),
+    '55000',
+    NULL,
+    'apply_subscription_change_request rejects an expired request'
+);
+
+-- ==============================
+-- USAGE TRACKING
+-- ==============================
+
+SELECT create_feature('emails_sent', 'Emails Sent', 'metered', p_unit := 'emails') AS emails_feature \gset
+
+SELECT record_usage(
+    'customer-4', 'emails_sent', '2026-07-01'::timestamptz, '2026-08-01'::timestamptz,
+    p_quantity := 10, p_subscription_id := :'feature_sub_id'::uuid, p_idempotency_key := 'usage-idem-1'
+) AS usage_1 \gset
+
+SELECT record_usage(
+    'customer-4', 'emails_sent', '2026-07-01'::timestamptz, '2026-08-01'::timestamptz,
+    p_quantity := 10, p_subscription_id := :'feature_sub_id'::uuid, p_idempotency_key := 'usage-idem-1'
+) AS usage_2 \gset
+
+SELECT is(:'usage_1'::uuid, :'usage_2'::uuid, 'record_usage with a repeated idempotency_key returns the original usage record id');
+
+SELECT record_usage(
+    'customer-4', 'emails_sent', '2026-07-01'::timestamptz, '2026-08-01'::timestamptz,
+    p_quantity := 5, p_subscription_id := :'feature_sub_id'::uuid
+) AS usage_3 \gset
+
+SELECT is(
+    (SELECT total_quantity FROM usage_summaries WHERE subscription_id = :'feature_sub_id'::uuid AND feature_key = 'emails_sent'),
+    15::bigint,
+    'usage_summaries sums distinct usage_records for the same period, but a repeated idempotency_key does not double-count'
+);
+
+-- ==============================
+-- INVOICING & CREDIT NOTES
+-- ==============================
+
+SELECT create_order(
+    'customer-4', 'USD',
+    jsonb_build_array(jsonb_build_object('price_id', :'plan_price_v2'::uuid, 'quantity', 1))
+) AS invoice_order_id \gset
+
+SELECT create_invoice(
+    'customer-4', 'USD', :'feature_sub_id'::uuid, :'invoice_order_id'::uuid, 'subscription_cycle',
+    p_idempotency_key := 'invoice-idem-1'
+) AS invoice_1 \gset
+
+SELECT create_invoice(
+    'customer-4', 'USD', :'feature_sub_id'::uuid, :'invoice_order_id'::uuid, 'subscription_cycle',
+    p_idempotency_key := 'invoice-idem-1'
+) AS invoice_2 \gset
+
+SELECT is(:'invoice_1'::uuid, :'invoice_2'::uuid, 'create_invoice with a repeated idempotency_key returns the original invoice id');
+
+SELECT is(
+    (SELECT subtotal_amount FROM invoices WHERE uid = :'invoice_1'::uuid),
+    3000::bigint,
+    'create_invoice seeds subtotal_amount from the linked order'
+);
+
+SELECT add_invoice_line_item(:'invoice_1'::uuid, 'tax', 'VAT 5%', 150) AS tax_line_item_id \gset
+
+SELECT is(
+    (SELECT total_amount FROM invoices WHERE uid = :'invoice_1'::uuid),
+    3150::bigint,
+    'add_invoice_line_item recomputes total_amount from the order subtotal plus line items'
+);
+
+SELECT throws_ok(
+    format($fmt$ SELECT add_invoice_line_item('%s'::uuid, 'bogus', 'x', 100) $fmt$, :'invoice_1'),
+    '23514',
+    NULL,
+    'add_invoice_line_item rejects a type outside the allowed set'
+);
+
+SELECT lives_ok(
+    format($fmt$ SELECT finalize_invoice('%s'::uuid) $fmt$, :'invoice_1'),
+    'finalize_invoice runs without error on a draft invoice'
+);
+
+SELECT is(
+    (SELECT status::text FROM invoices WHERE uid = :'invoice_1'::uuid),
+    'open',
+    'finalize_invoice transitions the invoice from draft to open'
+);
+
+SELECT throws_ok(
+    format($fmt$ SELECT add_invoice_line_item('%s'::uuid, 'tax', 'late fee', 10) $fmt$, :'invoice_1'),
+    '55000',
+    NULL,
+    'add_invoice_line_item rejects a non-draft invoice'
+);
+
+SELECT lives_ok(
+    format($fmt$ SELECT mark_invoice_paid('%s'::uuid) $fmt$, :'invoice_1'),
+    'mark_invoice_paid runs without error on an open invoice'
+);
+
+SELECT is(
+    (SELECT status::text FROM invoices WHERE uid = :'invoice_1'::uuid),
+    'paid',
+    'mark_invoice_paid with no explicit amount pays the invoice in full'
+);
+
+SELECT is(
+    (SELECT amount_due FROM invoices WHERE uid = :'invoice_1'::uuid),
+    0::bigint,
+    'a fully paid invoice has no amount due'
+);
+
+SELECT throws_ok(
+    format($fmt$ SELECT void_invoice('%s'::uuid) $fmt$, :'invoice_1'),
+    '55000',
+    NULL,
+    'void_invoice rejects a paid invoice -- it must be adjusted with a credit note instead'
+);
+
+SELECT issue_credit_note(:'invoice_1'::uuid, 'order_change', 500) AS credit_note_1 \gset
+
+SELECT is(
+    (SELECT total_amount FROM credit_notes WHERE uid = :'credit_note_1'::uuid),
+    500::bigint,
+    'issue_credit_note records the requested amount'
+);
+
+SELECT throws_ok(
+    format($fmt$ SELECT issue_credit_note('%s'::uuid, 'order_change', 5000) $fmt$, :'invoice_1'),
+    '23514',
+    NULL,
+    'issue_credit_note rejects an amount that would exceed the invoice total once already-issued credits are included'
+);
+
+SELECT lives_ok(
+    format($fmt$ SELECT void_credit_note('%s'::uuid) $fmt$, :'credit_note_1'),
+    'void_credit_note runs without error on an issued credit note'
+);
+
+SELECT is(
+    (SELECT status::text FROM credit_notes WHERE uid = :'credit_note_1'::uuid),
+    'void',
+    'void_credit_note transitions the credit note to void'
+);
+
+SELECT throws_ok(
+    format($fmt$ SELECT void_credit_note('%s'::uuid) $fmt$, :'credit_note_1'),
+    '55000',
+    NULL,
+    'void_credit_note rejects a credit note that is not issued'
+);
+
+-- ==============================
+-- ENTERPRISE CONTRACTS
+-- ==============================
+
+SELECT throws_ok(
+    format(
+        $fmt$ INSERT INTO subscription_contracts (customer_id, subscription_id, start_date, end_date)
+              VALUES ('customer-4', '%s'::uuid, '2026-06-01', '2026-01-01') $fmt$,
+        :'feature_sub_id'
+    ),
+    '23514',
+    NULL,
+    'subscription_contracts rejects an end_date before start_date'
+);
+
+SELECT lives_ok(
+    format(
+        $fmt$ INSERT INTO subscription_contracts (customer_id, subscription_id, start_date, sla_tier, signed_by)
+              VALUES ('customer-4', '%s'::uuid, '2026-06-01', 'gold', 'jane@example.com') $fmt$,
+        :'feature_sub_id'
+    ),
+    'subscription_contracts accepts a decoupled, plain-text signed_by identifier'
+);
+
+SELECT is(
+    (SELECT status::text FROM subscription_contracts WHERE customer_id = 'customer-4'),
+    'draft',
+    'a freshly inserted contract defaults to draft status'
 );
 
 SELECT * FROM finish();

@@ -13,8 +13,21 @@
 -- integrating a new provider never requires a schema change -- only a worker that claims
 -- webhook_events for it via claim_webhook_events().
 --
--- Out of scope for this version (candidates for a later extension): invoices, coupons, tax,
--- credit notes, gift cards, payouts, revenue-share/marketplace splits, disputes, proration.
+-- SaaS billing extensions (features, entitlements, addons, seats, change requests, invoices,
+-- credit notes, contracts, usage) build on top of the existing catalog/subscriptions/orders
+-- rather than duplicating them: a "plan" is a product, a "plan version" is a price, and an
+-- "addon" is just a product flagged products.is_addon -- so entitlements attach to prices
+-- once (price_feature_entitlements) and apply to both. tenant_id/customer_id stay plain text
+-- everywhere, so this extension never needs to know about an app's own organizations/accounts
+-- tables; the calling application owns its own authorization model. Unlike the tables above,
+-- these newer tables enable RLS with no default policies (AGENTS.md), so a consuming app must
+-- add its own policies (or grant to a role with BYPASSRLS) before it can read/write them.
+--
+-- Out of scope for this version (candidates for a later extension): coupons, tax calculation,
+-- gift cards, payouts, revenue-share/marketplace splits, disputes, and automatic proration
+-- math -- proration_behavior/payment_behavior on subscription_change_requests only record the
+-- caller's intent; computing the actual amount and posting it as an invoice line item is left
+-- to the application.
 
 -- ==============================
 -- TYPES
@@ -71,12 +84,112 @@ CREATE TYPE webhook_event_status AS ENUM (
     'failed'
 );
 
+-- Extended (from the original 5-value set) to add 'incomplete_expired' (payment never
+-- completed before expiry), 'paused' (pause_subscription/resume_subscription), and
+-- 'expired' (a fixed-term contract or trial that ended without renewing).
 CREATE TYPE subscription_status AS ENUM (
+    'incomplete',
+    'incomplete_expired',
     'trialing',
     'active',
     'past_due',
+    'paused',
     'cancelled',
-    'incomplete'
+    'expired'
+);
+
+-- ---- SaaS billing extensions ----
+
+CREATE TYPE proration_behavior AS ENUM (
+    'create_prorations',
+    'none',
+    'always_invoice'
+);
+
+CREATE TYPE payment_behavior AS ENUM (
+    'default_incomplete',
+    'error_if_incomplete',
+    'allow_incomplete'
+);
+
+CREATE TYPE change_request_type AS ENUM (
+    'create',
+    'upgrade',
+    'downgrade',
+    'cancel',
+    'pause',
+    'resume',
+    'renew',
+    'add_seats',
+    'remove_seats',
+    'add_addon',
+    'remove_addon'
+);
+
+CREATE TYPE change_request_status AS ENUM (
+    'pending',
+    'processing',
+    'awaiting_payment',
+    'completed',
+    'failed',
+    'cancelled',
+    'expired'
+);
+
+CREATE TYPE invoice_status AS ENUM (
+    'draft',
+    'open',
+    'paid',
+    'void',
+    'uncollectible'
+);
+
+CREATE TYPE billing_reason AS ENUM (
+    'subscription_create',
+    'subscription_cycle',
+    'subscription_update',
+    'manual',
+    'usage_threshold'
+);
+
+CREATE TYPE feature_type AS ENUM (
+    'boolean',
+    'limit',
+    'metered'
+);
+
+CREATE TYPE feature_reset_period AS ENUM (
+    'daily',
+    'weekly',
+    'monthly',
+    'yearly',
+    'never'
+);
+
+CREATE TYPE entitlement_source AS ENUM (
+    'plan',
+    'addon',
+    'override',
+    'promotion'
+);
+
+CREATE TYPE contract_status AS ENUM (
+    'draft',
+    'active',
+    'expired',
+    'terminated'
+);
+
+CREATE TYPE credit_note_status AS ENUM (
+    'issued',
+    'void'
+);
+
+CREATE TYPE credit_note_reason AS ENUM (
+    'duplicate',
+    'fraudulent',
+    'order_change',
+    'product_unsatisfactory'
 );
 
 -- ==============================
@@ -159,11 +272,14 @@ CREATE TABLE products (
     tenant_id   text,
     name        text        NOT NULL,
     description text,
+    is_addon    boolean     NOT NULL DEFAULT false,
     active      boolean     NOT NULL DEFAULT true,
     metadata    jsonb       NOT NULL DEFAULT '{}',
     created_at  timestamptz NOT NULL DEFAULT now(),
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
+
+COMMENT ON TABLE @extschema@.products IS 'is_addon distinguishes an addon product from a plan product; both price the same way via prices, and both can carry feature entitlements via price_feature_entitlements, so subscriptions and subscription_addons share one catalog instead of two';
 
 CREATE TABLE prices (
     id               uuid             NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
@@ -284,6 +400,7 @@ CREATE TABLE subscriptions (
     customer_id           text,
     price_id              uuid                NOT NULL REFERENCES prices(id) ON DELETE RESTRICT,
     status                subscription_status NOT NULL DEFAULT 'incomplete',
+    quantity              integer             NOT NULL DEFAULT 1 CHECK (quantity > 0),
     current_period_start  timestamptz         NOT NULL DEFAULT now(),
     current_period_end    timestamptz         NOT NULL,
     cancel_at_period_end  boolean             NOT NULL DEFAULT false,
@@ -305,6 +422,257 @@ CREATE TABLE subscription_events (
 );
 
 COMMENT ON TABLE @extschema@.subscription_events IS 'Append-only audit trail: created, renewed, price_changed, cancelled, past_due, ...';
+
+-- ---- SaaS billing: features & entitlements ----
+--
+-- Tables from here down follow AGENTS.md exactly (bigint identity PK + uid, RLS enabled with
+-- no default policy) rather than the uuid-PK/no-RLS style above, and are additive: nothing
+-- above this point changes behavior except products.is_addon and subscriptions.quantity.
+
+CREATE TABLE features (
+    id          bigint               GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    uid         uuid                 NOT NULL DEFAULT gen_random_uuid(),
+    key         text                 NOT NULL CHECK (char_length(key) BETWEEN 1 AND 100),
+    name        text                 NOT NULL CHECK (char_length(name) BETWEEN 1 AND 255),
+    description text                 CHECK (char_length(description) <= 1000),
+    type        feature_type         NOT NULL,
+    unit        text                 CHECK (char_length(unit) <= 100),
+    is_active   boolean              NOT NULL DEFAULT true,
+    created_at  timestamptz          NOT NULL DEFAULT now(),
+    CONSTRAINT unique_features_uid UNIQUE (uid),
+    CONSTRAINT unique_features_key UNIQUE (key)
+);
+ALTER TABLE features ENABLE ROW LEVEL SECURITY;
+
+COMMENT ON TABLE @extschema@.features IS 'Global catalog of entitlement-checkable capabilities; boolean/limit features are read from subscription_entitlements, metered features are additionally tracked in usage_records/usage_summaries';
+
+CREATE TABLE price_feature_entitlements (
+    id           bigint               GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    uid          uuid                 NOT NULL DEFAULT gen_random_uuid(),
+    price_id     uuid                 NOT NULL REFERENCES prices(id)  ON DELETE CASCADE,
+    feature_id   bigint               NOT NULL REFERENCES features(id) ON DELETE RESTRICT,
+    value_boolean boolean,
+    value_limit  bigint,
+    reset_period feature_reset_period NOT NULL DEFAULT 'monthly',
+    created_at   timestamptz          NOT NULL DEFAULT now(),
+    CONSTRAINT unique_price_feature_entitlements_uid UNIQUE (uid),
+    CONSTRAINT unique_price_feature_entitlements_price_feature UNIQUE (price_id, feature_id)
+);
+ALTER TABLE price_feature_entitlements ENABLE ROW LEVEL SECURITY;
+
+COMMENT ON TABLE @extschema@.price_feature_entitlements IS 'What a price (plan price or addon price -- see products.is_addon) grants; value_limit = -1 means unlimited. One table serves both plans and addons since both are just prices';
+
+-- ---- SaaS billing: addons ----
+
+CREATE TABLE subscription_addons (
+    id              bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    uid             uuid        NOT NULL DEFAULT gen_random_uuid(),
+    subscription_id uuid        NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+    price_id        uuid        NOT NULL REFERENCES prices(id)        ON DELETE RESTRICT,
+    quantity        integer     NOT NULL DEFAULT 1 CHECK (quantity > 0),
+    status          text        NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'cancelled')),
+    started_at      timestamptz NOT NULL DEFAULT now(),
+    ends_at         timestamptz,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT unique_subscription_addons_uid UNIQUE (uid)
+);
+ALTER TABLE subscription_addons ENABLE ROW LEVEL SECURITY;
+
+COMMENT ON TABLE @extschema@.subscription_addons IS 'An addon attached to a subscription; price_id must belong to a product with is_addon = true (enforced in add_subscription_addon(), not a CHECK, since it requires a cross-table lookup)';
+
+-- ---- SaaS billing: subscription change requests (state machine) ----
+
+CREATE TABLE subscription_change_requests (
+    id                  bigint                GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    uid                 uuid                  NOT NULL DEFAULT gen_random_uuid(),
+    subscription_id     uuid                  REFERENCES subscriptions(id) ON DELETE SET NULL,
+    tenant_id           text,
+    customer_id         text                  NOT NULL,
+    type                change_request_type   NOT NULL,
+    status              change_request_status NOT NULL DEFAULT 'pending',
+    current_price_id    uuid                  REFERENCES prices(id) ON DELETE RESTRICT,
+    target_price_id     uuid                  REFERENCES prices(id) ON DELETE RESTRICT,
+    effective_at        timestamptz,
+    proration_behavior  proration_behavior    NOT NULL DEFAULT 'create_prorations',
+    payment_behavior    payment_behavior      NOT NULL DEFAULT 'default_incomplete',
+    idempotency_key     text,
+    failure_reason      text,
+    metadata            jsonb                 NOT NULL DEFAULT '{}',
+    created_at          timestamptz           NOT NULL DEFAULT now(),
+    processed_at        timestamptz,
+    expires_at          timestamptz           NOT NULL DEFAULT (now() + interval '24 hours'),
+    CONSTRAINT unique_subscription_change_requests_uid UNIQUE (uid),
+    CONSTRAINT unique_subscription_change_requests_idempotency_key UNIQUE (idempotency_key)
+);
+ALTER TABLE subscription_change_requests ENABLE ROW LEVEL SECURITY;
+
+COMMENT ON TABLE @extschema@.subscription_change_requests IS 'An async/idempotent request to mutate a subscription; apply_subscription_change_request() dispatches it to the existing direct-mutation functions (cancel_subscription, change_subscription_price, ...) and records the outcome. Direct calls to those functions remain valid for callers that do not need the queue/idempotency/payment-gating semantics';
+
+-- ---- SaaS billing: invoices & credit notes ----
+
+CREATE TABLE invoices (
+    id               bigint         GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    uid              uuid           NOT NULL DEFAULT gen_random_uuid(),
+    tenant_id        text,
+    customer_id      text           NOT NULL,
+    subscription_id  uuid           REFERENCES subscriptions(id) ON DELETE SET NULL,
+    order_id         uuid           REFERENCES orders(id)        ON DELETE SET NULL,
+    status           invoice_status NOT NULL DEFAULT 'draft',
+    number           text,
+    currency         text           NOT NULL,
+    subtotal_amount  bigint         NOT NULL DEFAULT 0,
+    tax_amount       bigint         NOT NULL DEFAULT 0,
+    discount_amount  bigint         NOT NULL DEFAULT 0,
+    total_amount     bigint         NOT NULL DEFAULT 0,
+    amount_due       bigint         NOT NULL DEFAULT 0,
+    amount_paid      bigint         NOT NULL DEFAULT 0,
+    billing_reason   billing_reason,
+    period_start     timestamptz,
+    period_end       timestamptz,
+    due_date         timestamptz,
+    paid_at          timestamptz,
+    voided_at        timestamptz,
+    provider         text,
+    provider_invoice_id text,
+    idempotency_key  text,
+    metadata         jsonb          NOT NULL DEFAULT '{}',
+    created_at       timestamptz    NOT NULL DEFAULT now(),
+    CONSTRAINT unique_invoices_uid UNIQUE (uid),
+    CONSTRAINT unique_invoices_number UNIQUE (number),
+    CONSTRAINT unique_invoices_provider_invoice_id UNIQUE (provider_invoice_id),
+    CONSTRAINT unique_invoices_idempotency_key UNIQUE (idempotency_key)
+);
+ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
+
+COMMENT ON TABLE @extschema@.invoices IS 'A billing document wrapping an order (subtotal/line items already captured by orders/order_items) plus billing-only adjustments in invoice_line_items (proration/tax/discount/credit/usage). number is assigned explicitly by create_invoice() via next_invoice_number(), not a column default, so it stays out of the WHEN/THEN chain of any future bulk-copy tooling';
+
+CREATE TABLE invoice_line_items (
+    id            bigint        GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    uid           uuid          NOT NULL DEFAULT gen_random_uuid(),
+    invoice_id    bigint        NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+    type          text          NOT NULL CHECK (type IN ('proration', 'tax', 'discount', 'credit', 'usage')),
+    description   text          NOT NULL,
+    quantity      numeric(12,4) NOT NULL DEFAULT 1,
+    unit_amount   bigint        NOT NULL DEFAULT 0,
+    total_amount  bigint        NOT NULL DEFAULT 0,
+    period_start  timestamptz,
+    period_end    timestamptz,
+    feature_key   text,
+    metadata      jsonb         NOT NULL DEFAULT '{}',
+    created_at    timestamptz   NOT NULL DEFAULT now(),
+    CONSTRAINT unique_invoice_line_items_uid UNIQUE (uid)
+);
+ALTER TABLE invoice_line_items ENABLE ROW LEVEL SECURITY;
+
+COMMENT ON TABLE @extschema@.invoice_line_items IS 'Billing-only adjustments on top of an invoice''s underlying order; ordinary subscription/one_time charges live in order_items, not here, so the two never duplicate the same line';
+
+CREATE TABLE credit_notes (
+    id                      bigint             GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    uid                     uuid               NOT NULL DEFAULT gen_random_uuid(),
+    invoice_id              bigint             NOT NULL REFERENCES invoices(id) ON DELETE RESTRICT,
+    tenant_id               text,
+    customer_id             text               NOT NULL,
+    number                  text,
+    status                  credit_note_status NOT NULL DEFAULT 'issued',
+    reason                  credit_note_reason NOT NULL,
+    currency                text               NOT NULL,
+    total_amount            bigint             NOT NULL CHECK (total_amount > 0),
+    provider_credit_note_id text,
+    created_at              timestamptz        NOT NULL DEFAULT now(),
+    voided_at               timestamptz,
+    CONSTRAINT unique_credit_notes_uid UNIQUE (uid),
+    CONSTRAINT unique_credit_notes_number UNIQUE (number),
+    CONSTRAINT unique_credit_notes_provider_credit_note_id UNIQUE (provider_credit_note_id)
+);
+ALTER TABLE credit_notes ENABLE ROW LEVEL SECURITY;
+
+COMMENT ON TABLE @extschema@.credit_notes IS 'A paper-trail record that an invoice''s amount owed was reduced; posting the corresponding ledger reversal (mirroring mark_refund_succeeded) is left to the application for this version';
+
+-- ---- SaaS billing: enterprise contracts ----
+
+CREATE TABLE subscription_contracts (
+    id                  bigint          GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    uid                 uuid            NOT NULL DEFAULT gen_random_uuid(),
+    tenant_id           text,
+    customer_id         text            NOT NULL,
+    subscription_id     uuid            REFERENCES subscriptions(id) ON DELETE SET NULL,
+    status              contract_status NOT NULL DEFAULT 'draft',
+    start_date          date            NOT NULL,
+    end_date            date,
+    custom_pricing      jsonb           NOT NULL DEFAULT '{}',
+    negotiated_features jsonb           NOT NULL DEFAULT '{}',
+    sla_tier            text            CHECK (char_length(sla_tier) <= 100),
+    document_url        text            CHECK (char_length(document_url) <= 2048),
+    signed_at           timestamptz,
+    signed_by           text,
+    created_at          timestamptz     NOT NULL DEFAULT now(),
+    CONSTRAINT unique_subscription_contracts_uid UNIQUE (uid),
+    CONSTRAINT check_subscription_contracts_dates CHECK (end_date IS NULL OR end_date >= start_date)
+);
+ALTER TABLE subscription_contracts ENABLE ROW LEVEL SECURITY;
+
+COMMENT ON TABLE @extschema@.subscription_contracts IS 'signed_by is plain text (an email or external identifier), not an FK, keeping this table decoupled from any app-specific accounts table';
+
+-- ---- SaaS billing: entitlements (computed cache) & usage ----
+
+CREATE TABLE subscription_entitlements (
+    id            bigint             GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    uid           uuid               NOT NULL DEFAULT gen_random_uuid(),
+    subscription_id uuid             NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+    feature_id    bigint             NOT NULL REFERENCES features(id)      ON DELETE CASCADE,
+    feature_key   text               NOT NULL,
+    value_boolean boolean,
+    value_limit   bigint,
+    is_unlimited  boolean            NOT NULL DEFAULT false,
+    source        entitlement_source NOT NULL DEFAULT 'plan',
+    computed_at   timestamptz        NOT NULL DEFAULT now(),
+    valid_until   timestamptz,
+    created_at    timestamptz        NOT NULL DEFAULT now(),
+    CONSTRAINT unique_subscription_entitlements_uid UNIQUE (uid),
+    CONSTRAINT unique_subscription_entitlements_subscription_feature UNIQUE (subscription_id, feature_id)
+);
+ALTER TABLE subscription_entitlements ENABLE ROW LEVEL SECURITY;
+
+COMMENT ON TABLE @extschema@.subscription_entitlements IS 'Computed/cached by recompute_subscription_entitlements(), never hand-edited except for source = override/promotion rows, which recompute deliberately leaves alone (see the ON CONFLICT guard there)';
+
+CREATE TABLE usage_records (
+    id              bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    uid             uuid        NOT NULL DEFAULT gen_random_uuid(),
+    subscription_id uuid        REFERENCES subscriptions(id) ON DELETE CASCADE,
+    feature_id      bigint      NOT NULL REFERENCES features(id) ON DELETE RESTRICT,
+    feature_key     text        NOT NULL,
+    quantity        bigint      NOT NULL DEFAULT 1,
+    recorded_at     timestamptz NOT NULL DEFAULT now(),
+    period_start    timestamptz NOT NULL,
+    period_end      timestamptz NOT NULL,
+    idempotency_key text,
+    metadata        jsonb       NOT NULL DEFAULT '{}',
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT unique_usage_records_uid UNIQUE (uid),
+    CONSTRAINT unique_usage_records_idempotency_key UNIQUE (idempotency_key),
+    CONSTRAINT check_usage_records_period CHECK (period_end > period_start)
+);
+ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;
+
+COMMENT ON TABLE @extschema@.usage_records IS 'Append-only raw usage events for metered features; record_usage() resolves subscription_id from the customer''s active subscription when not supplied and rolls the quantity into usage_summaries in the same call';
+
+CREATE TABLE usage_summaries (
+    id              bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    uid             uuid        NOT NULL DEFAULT gen_random_uuid(),
+    subscription_id uuid        NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+    feature_id      bigint      NOT NULL REFERENCES features(id)      ON DELETE RESTRICT,
+    feature_key     text        NOT NULL,
+    period_start    timestamptz NOT NULL,
+    period_end      timestamptz NOT NULL,
+    total_quantity  bigint      NOT NULL DEFAULT 0,
+    last_updated_at timestamptz NOT NULL DEFAULT now(),
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT unique_usage_summaries_uid UNIQUE (uid),
+    CONSTRAINT unique_usage_summaries_subscription_feature_period UNIQUE (subscription_id, feature_id, period_start, period_end)
+);
+ALTER TABLE usage_summaries ENABLE ROW LEVEL SECURITY;
+
+COMMENT ON TABLE @extschema@.usage_summaries IS 'Rollup cache maintained by record_usage(); never written to directly, mirroring ledger_account_balances/sync_account_balance()';
 
 -- ==============================
 -- INDEXES
@@ -363,6 +731,46 @@ CREATE UNIQUE INDEX subscriptions_idempotency_key_idx ON subscriptions (idempote
 CREATE INDEX subscriptions_renewal_due_idx ON subscriptions (current_period_end) WHERE status IN ('active', 'trialing');
 
 CREATE INDEX subscription_events_subscription_idx ON subscription_events (subscription_id);
+
+-- ---- SaaS billing extensions (idx_<table>_<columns> naming per AGENTS.md) ----
+
+CREATE INDEX idx_features_type ON features (type) WHERE is_active = true;
+
+CREATE INDEX idx_price_feature_entitlements_price ON price_feature_entitlements (price_id);
+CREATE INDEX idx_price_feature_entitlements_feature ON price_feature_entitlements (feature_id);
+
+CREATE INDEX idx_subscription_addons_subscription ON subscription_addons (subscription_id);
+CREATE INDEX idx_subscription_addons_price ON subscription_addons (price_id);
+CREATE INDEX idx_subscription_addons_active ON subscription_addons (subscription_id) WHERE status = 'active';
+
+CREATE INDEX idx_change_requests_subscription ON subscription_change_requests (subscription_id);
+CREATE INDEX idx_change_requests_customer ON subscription_change_requests (customer_id);
+CREATE INDEX idx_change_requests_status ON subscription_change_requests (status);
+CREATE INDEX idx_change_requests_expires ON subscription_change_requests (expires_at) WHERE status IN ('pending', 'processing', 'awaiting_payment');
+
+CREATE INDEX idx_invoices_customer ON invoices (customer_id);
+CREATE INDEX idx_invoices_subscription ON invoices (subscription_id) WHERE subscription_id IS NOT NULL;
+CREATE INDEX idx_invoices_order ON invoices (order_id) WHERE order_id IS NOT NULL;
+CREATE INDEX idx_invoices_status ON invoices (status);
+CREATE INDEX idx_invoices_tenant ON invoices (tenant_id) WHERE tenant_id IS NOT NULL;
+CREATE INDEX idx_invoices_period ON invoices (customer_id, period_start, period_end);
+
+CREATE INDEX idx_invoice_line_items_invoice ON invoice_line_items (invoice_id);
+
+CREATE INDEX idx_credit_notes_invoice ON credit_notes (invoice_id);
+CREATE INDEX idx_credit_notes_customer ON credit_notes (customer_id);
+
+CREATE INDEX idx_contracts_customer ON subscription_contracts (customer_id);
+CREATE INDEX idx_contracts_subscription ON subscription_contracts (subscription_id) WHERE subscription_id IS NOT NULL;
+
+CREATE INDEX idx_entitlements_subscription ON subscription_entitlements (subscription_id);
+CREATE INDEX idx_entitlements_feature_key ON subscription_entitlements (feature_key);
+
+CREATE INDEX idx_usage_records_subscription_period ON usage_records (subscription_id, period_start, period_end) WHERE subscription_id IS NOT NULL;
+CREATE INDEX idx_usage_records_feature_key ON usage_records (feature_key);
+
+CREATE INDEX idx_usage_summaries_subscription_period ON usage_summaries (subscription_id, period_start);
+CREATE INDEX idx_usage_summaries_feature_key ON usage_summaries (feature_key);
 
 -- ==============================
 -- IMMUTABILITY
@@ -1747,6 +2155,8 @@ BEGIN
     INSERT INTO subscription_events (subscription_id, type, payload)
     VALUES (v_subscription_id, 'created', jsonb_build_object('price_id', p_price_id, 'status', v_status));
 
+    PERFORM recompute_subscription_entitlements(v_subscription_id);
+
     RETURN v_subscription_id;
 END;
 $$;
@@ -1884,6 +2294,839 @@ BEGIN
 
     INSERT INTO subscription_events (subscription_id, type, payload)
     VALUES (p_subscription_id, 'price_changed', jsonb_build_object('old_price_id', v_subscription.price_id, 'new_price_id', p_new_price_id));
+
+    PERFORM recompute_subscription_entitlements(p_subscription_id);
+END;
+$$;
+
+-- ==============================
+-- SAAS BILLING API
+-- ==============================
+
+-- ---- Numbering ----
+
+CREATE SEQUENCE invoice_number_seq START 1;
+CREATE SEQUENCE credit_note_number_seq START 1;
+
+CREATE OR REPLACE FUNCTION next_invoice_number()
+RETURNS text
+LANGUAGE sql
+SET search_path = @extschema@, pg_catalog
+AS $$
+    SELECT 'INV-' || to_char(now(), 'YYYY') || '-' || lpad(nextval('invoice_number_seq')::text, 6, '0');
+$$;
+
+CREATE OR REPLACE FUNCTION next_credit_note_number()
+RETURNS text
+LANGUAGE sql
+SET search_path = @extschema@, pg_catalog
+AS $$
+    SELECT 'CN-' || to_char(now(), 'YYYY') || '-' || lpad(nextval('credit_note_number_seq')::text, 6, '0');
+$$;
+
+-- ---- Features & entitlements ----
+
+CREATE OR REPLACE FUNCTION create_feature(
+    p_key         text,
+    p_name        text,
+    p_type        text,
+    p_description text  DEFAULT NULL,
+    p_unit        text  DEFAULT NULL
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SET search_path = @extschema@, pg_catalog
+AS $$
+DECLARE
+    v_uid uuid;
+BEGIN
+    IF p_key IS NULL OR trim(p_key) = '' THEN
+        RAISE EXCEPTION 'feature key is required' USING ERRCODE = '22023';
+    END IF;
+
+    INSERT INTO features (key, name, description, type, unit)
+    VALUES (p_key, p_name, p_description, p_type::feature_type, p_unit)
+    RETURNING uid INTO v_uid;
+
+    RETURN v_uid;
+END;
+$$;
+
+-- Upserts by (price_id, feature_id) so re-declaring the same price/feature pair updates the
+-- existing entitlement instead of erroring or duplicating it.
+CREATE OR REPLACE FUNCTION set_price_entitlement(
+    p_price_id      uuid,
+    p_feature_key   text,
+    p_value_boolean boolean DEFAULT NULL,
+    p_value_limit   bigint  DEFAULT NULL,
+    p_reset_period  text    DEFAULT 'monthly'
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SET search_path = @extschema@, pg_catalog
+AS $$
+DECLARE
+    v_feature_id bigint;
+    v_uid        uuid;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM prices WHERE id = p_price_id) THEN
+        RAISE EXCEPTION 'price % not found', p_price_id USING ERRCODE = 'P0002';
+    END IF;
+
+    SELECT id INTO v_feature_id FROM features WHERE key = p_feature_key;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'feature % not found', p_feature_key USING ERRCODE = 'P0002';
+    END IF;
+
+    INSERT INTO price_feature_entitlements (price_id, feature_id, value_boolean, value_limit, reset_period)
+    VALUES (p_price_id, v_feature_id, p_value_boolean, p_value_limit, p_reset_period::feature_reset_period)
+    ON CONFLICT (price_id, feature_id) DO UPDATE
+        SET value_boolean = EXCLUDED.value_boolean,
+            value_limit   = EXCLUDED.value_limit,
+            reset_period  = EXCLUDED.reset_period
+    RETURNING uid INTO v_uid;
+
+    RETURN v_uid;
+END;
+$$;
+
+-- Recomputes a subscription's cached entitlements from its own price plus its active addons'
+-- prices (both read from the same price_feature_entitlements table -- see products.is_addon).
+-- A feature granted by both is merged permissively: booleans OR together, limits take the
+-- larger value (or -1/unlimited if either grants unlimited). Rows with source = override or
+-- promotion are deliberately left untouched by the ON CONFLICT guard below, so a manually
+-- granted override always wins over whatever the plan/addons would otherwise compute.
+CREATE OR REPLACE FUNCTION recompute_subscription_entitlements(
+    p_subscription_id uuid
+)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = @extschema@, pg_catalog
+AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM subscriptions WHERE id = p_subscription_id) THEN
+        RAISE EXCEPTION 'subscription % not found', p_subscription_id USING ERRCODE = 'P0002';
+    END IF;
+
+    DELETE FROM subscription_entitlements
+    WHERE subscription_id = p_subscription_id
+      AND source IN ('plan', 'addon');
+
+    INSERT INTO subscription_entitlements (
+        subscription_id, feature_id, feature_key,
+        value_boolean, value_limit, is_unlimited, source, computed_at
+    )
+    SELECT
+        p_subscription_id,
+        combined.feature_id,
+        combined.feature_key,
+        bool_or(combined.value_boolean),
+        CASE WHEN coalesce(bool_or(combined.value_limit = -1), false) THEN -1 ELSE max(combined.value_limit) END,
+        coalesce(bool_or(combined.value_limit = -1), false),
+        CASE WHEN bool_or(combined.is_addon) THEN 'addon' ELSE 'plan' END::entitlement_source,
+        now()
+    FROM (
+        SELECT f.id AS feature_id, f.key AS feature_key,
+               pfe.value_boolean, pfe.value_limit, false AS is_addon
+        FROM subscriptions s
+        JOIN price_feature_entitlements pfe ON pfe.price_id = s.price_id
+        JOIN features f ON f.id = pfe.feature_id
+        WHERE s.id = p_subscription_id
+
+        UNION ALL
+
+        SELECT f.id, f.key, afe.value_boolean, afe.value_limit, true
+        FROM subscription_addons sa
+        JOIN price_feature_entitlements afe ON afe.price_id = sa.price_id
+        JOIN features f ON f.id = afe.feature_id
+        WHERE sa.subscription_id = p_subscription_id
+          AND sa.status = 'active'
+    ) combined
+    GROUP BY combined.feature_id, combined.feature_key
+    ON CONFLICT (subscription_id, feature_id) DO UPDATE
+        SET value_boolean = EXCLUDED.value_boolean,
+            value_limit   = EXCLUDED.value_limit,
+            is_unlimited  = EXCLUDED.is_unlimited,
+            source        = EXCLUDED.source,
+            computed_at   = EXCLUDED.computed_at
+        WHERE subscription_entitlements.source NOT IN ('override', 'promotion');
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION check_feature_entitlement(
+    p_subscription_id uuid,
+    p_feature_key     text
+)
+RETURNS TABLE (allowed boolean, value_limit bigint, is_unlimited boolean)
+LANGUAGE sql
+STABLE
+SET search_path = @extschema@, pg_catalog
+AS $$
+    SELECT coalesce(se.value_boolean, se.value_limit IS NULL OR se.value_limit <> 0, false),
+           se.value_limit,
+           coalesce(se.is_unlimited, false)
+    FROM subscription_entitlements se
+    WHERE se.subscription_id = p_subscription_id
+      AND se.feature_key = p_feature_key;
+$$;
+
+-- ---- Addons ----
+
+CREATE OR REPLACE FUNCTION add_subscription_addon(
+    p_subscription_id uuid,
+    p_price_id        uuid,
+    p_quantity        integer DEFAULT 1
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SET search_path = @extschema@, pg_catalog
+AS $$
+DECLARE
+    v_price prices;
+    v_uid   uuid;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM subscriptions WHERE id = p_subscription_id) THEN
+        RAISE EXCEPTION 'subscription % not found', p_subscription_id USING ERRCODE = 'P0002';
+    END IF;
+
+    SELECT p.* INTO v_price
+    FROM prices p
+    JOIN products pr ON pr.id = p.product_id
+    WHERE p.id = p_price_id AND pr.is_addon = true;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'price % is not an active addon price', p_price_id USING ERRCODE = 'P0002';
+    END IF;
+    IF NOT v_price.active THEN
+        RAISE EXCEPTION 'price % is not active', p_price_id USING ERRCODE = '55000';
+    END IF;
+    IF p_quantity <= 0 THEN
+        RAISE EXCEPTION 'quantity must be positive' USING ERRCODE = '22023';
+    END IF;
+
+    INSERT INTO subscription_addons (subscription_id, price_id, quantity)
+    VALUES (p_subscription_id, p_price_id, p_quantity)
+    RETURNING uid INTO v_uid;
+
+    INSERT INTO subscription_events (subscription_id, type, payload)
+    VALUES (p_subscription_id, 'addon_added', jsonb_build_object('price_id', p_price_id, 'quantity', p_quantity));
+
+    PERFORM recompute_subscription_entitlements(p_subscription_id);
+
+    RETURN v_uid;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION remove_subscription_addon(
+    p_subscription_addon_uid uuid,
+    p_reason                 text DEFAULT NULL
+)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = @extschema@, pg_catalog
+AS $$
+DECLARE
+    v_addon subscription_addons;
+BEGIN
+    SELECT * INTO v_addon FROM subscription_addons WHERE uid = p_subscription_addon_uid;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'subscription addon % not found', p_subscription_addon_uid USING ERRCODE = 'P0002';
+    END IF;
+
+    UPDATE subscription_addons
+    SET status = 'cancelled', ends_at = now()
+    WHERE id = v_addon.id;
+
+    INSERT INTO subscription_events (subscription_id, type, payload)
+    VALUES (v_addon.subscription_id, 'addon_removed', jsonb_build_object('price_id', v_addon.price_id, 'reason', p_reason));
+
+    PERFORM recompute_subscription_entitlements(v_addon.subscription_id);
+END;
+$$;
+
+-- ---- Seats, pause/resume ----
+
+CREATE OR REPLACE FUNCTION set_subscription_quantity(
+    p_subscription_id uuid,
+    p_quantity        integer
+)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = @extschema@, pg_catalog
+AS $$
+DECLARE
+    v_subscription subscriptions;
+BEGIN
+    IF p_quantity <= 0 THEN
+        RAISE EXCEPTION 'quantity must be positive' USING ERRCODE = '22023';
+    END IF;
+
+    SELECT * INTO v_subscription FROM subscriptions WHERE id = p_subscription_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'subscription % not found', p_subscription_id USING ERRCODE = 'P0002';
+    END IF;
+
+    UPDATE subscriptions SET quantity = p_quantity, updated_at = now() WHERE id = p_subscription_id;
+
+    INSERT INTO subscription_events (subscription_id, type, payload)
+    VALUES (p_subscription_id, 'quantity_changed', jsonb_build_object('old_quantity', v_subscription.quantity, 'new_quantity', p_quantity));
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION pause_subscription(
+    p_subscription_id uuid
+)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = @extschema@, pg_catalog
+AS $$
+DECLARE
+    v_subscription subscriptions;
+BEGIN
+    SELECT * INTO v_subscription FROM subscriptions WHERE id = p_subscription_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'subscription % not found', p_subscription_id USING ERRCODE = 'P0002';
+    END IF;
+    IF v_subscription.status NOT IN ('active', 'trialing', 'past_due') THEN
+        RAISE EXCEPTION 'subscription % is %, cannot pause', p_subscription_id, v_subscription.status
+            USING ERRCODE = '55000';
+    END IF;
+
+    UPDATE subscriptions SET status = 'paused', updated_at = now() WHERE id = p_subscription_id;
+
+    INSERT INTO subscription_events (subscription_id, type, payload)
+    VALUES (p_subscription_id, 'paused', jsonb_build_object('previous_status', v_subscription.status));
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION resume_subscription(
+    p_subscription_id uuid
+)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = @extschema@, pg_catalog
+AS $$
+DECLARE
+    v_subscription subscriptions;
+BEGIN
+    SELECT * INTO v_subscription FROM subscriptions WHERE id = p_subscription_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'subscription % not found', p_subscription_id USING ERRCODE = 'P0002';
+    END IF;
+    IF v_subscription.status <> 'paused' THEN
+        RAISE EXCEPTION 'subscription % is %, cannot resume', p_subscription_id, v_subscription.status
+            USING ERRCODE = '55000';
+    END IF;
+
+    UPDATE subscriptions SET status = 'active', updated_at = now() WHERE id = p_subscription_id;
+
+    INSERT INTO subscription_events (subscription_id, type, payload)
+    VALUES (p_subscription_id, 'resumed', '{}');
+END;
+$$;
+
+-- ---- Subscription change requests (state machine) ----
+
+CREATE OR REPLACE FUNCTION create_subscription_change_request(
+    p_customer_id        text,
+    p_type               text,
+    p_subscription_id    uuid        DEFAULT NULL,
+    p_target_price_id    uuid        DEFAULT NULL,
+    p_tenant_id          text        DEFAULT NULL,
+    p_proration_behavior text        DEFAULT 'create_prorations',
+    p_payment_behavior   text        DEFAULT 'default_incomplete',
+    p_effective_at       timestamptz DEFAULT NULL,
+    p_metadata           jsonb       DEFAULT '{}',
+    p_idempotency_key    text        DEFAULT NULL
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SET search_path = @extschema@, pg_catalog
+AS $$
+DECLARE
+    v_uid               uuid;
+    v_current_price_id  uuid;
+BEGIN
+    IF p_idempotency_key IS NOT NULL THEN
+        SELECT uid INTO v_uid FROM subscription_change_requests WHERE idempotency_key = p_idempotency_key;
+        IF FOUND THEN
+            RETURN v_uid;
+        END IF;
+    END IF;
+
+    IF p_subscription_id IS NOT NULL THEN
+        SELECT price_id INTO v_current_price_id FROM subscriptions WHERE id = p_subscription_id;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'subscription % not found', p_subscription_id USING ERRCODE = 'P0002';
+        END IF;
+    END IF;
+
+    -- A concurrent caller may insert the same idempotency_key between our pre-check above
+    -- and this insert; catch the resulting unique_violation and return the winner's request
+    -- id instead of raising, so the idempotency contract holds under a race.
+    BEGIN
+        INSERT INTO subscription_change_requests (
+            subscription_id, tenant_id, customer_id, type,
+            current_price_id, target_price_id, effective_at,
+            proration_behavior, payment_behavior, idempotency_key, metadata
+        )
+        VALUES (
+            p_subscription_id, p_tenant_id, p_customer_id, p_type::change_request_type,
+            v_current_price_id, p_target_price_id, p_effective_at,
+            p_proration_behavior::proration_behavior, p_payment_behavior::payment_behavior,
+            p_idempotency_key, coalesce(p_metadata, '{}')
+        )
+        RETURNING uid INTO v_uid;
+    EXCEPTION WHEN unique_violation THEN
+        SELECT uid INTO v_uid FROM subscription_change_requests WHERE idempotency_key = p_idempotency_key;
+        RETURN v_uid;
+    END;
+
+    RETURN v_uid;
+END;
+$$;
+
+-- Dispatches a pending change request to the existing direct-mutation functions and records
+-- the outcome; those functions remain independently callable for synchronous, non-queued use.
+CREATE OR REPLACE FUNCTION apply_subscription_change_request(
+    p_change_request_uid uuid
+)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = @extschema@, pg_catalog
+AS $$
+DECLARE
+    v_request subscription_change_requests;
+BEGIN
+    SELECT * INTO v_request FROM subscription_change_requests WHERE uid = p_change_request_uid FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'subscription change request % not found', p_change_request_uid USING ERRCODE = 'P0002';
+    END IF;
+    IF v_request.status NOT IN ('pending', 'awaiting_payment') THEN
+        RAISE EXCEPTION 'change request % is %, cannot apply', p_change_request_uid, v_request.status
+            USING ERRCODE = '55000';
+    END IF;
+    IF v_request.expires_at < now() THEN
+        UPDATE subscription_change_requests SET status = 'expired' WHERE id = v_request.id;
+        RAISE EXCEPTION 'change request % has expired', p_change_request_uid USING ERRCODE = '55000';
+    END IF;
+
+    UPDATE subscription_change_requests SET status = 'processing' WHERE id = v_request.id;
+
+    BEGIN
+        IF v_request.type = 'create' THEN
+            UPDATE subscription_change_requests
+            SET subscription_id = create_subscription(v_request.customer_id, v_request.target_price_id, v_request.tenant_id)
+            WHERE id = v_request.id;
+        ELSIF v_request.type IN ('upgrade', 'downgrade') THEN
+            PERFORM change_subscription_price(v_request.subscription_id, v_request.target_price_id);
+        ELSIF v_request.type = 'cancel' THEN
+            PERFORM cancel_subscription(v_request.subscription_id, true);
+        ELSIF v_request.type = 'pause' THEN
+            PERFORM pause_subscription(v_request.subscription_id);
+        ELSIF v_request.type = 'resume' THEN
+            PERFORM resume_subscription(v_request.subscription_id);
+        ELSIF v_request.type = 'renew' THEN
+            PERFORM renew_subscription(v_request.subscription_id);
+        ELSIF v_request.type = 'add_seats' THEN
+            PERFORM set_subscription_quantity(
+                v_request.subscription_id,
+                (SELECT quantity FROM subscriptions WHERE id = v_request.subscription_id)
+                    + coalesce((v_request.metadata->>'seats')::integer, 1)
+            );
+        ELSIF v_request.type = 'remove_seats' THEN
+            PERFORM set_subscription_quantity(
+                v_request.subscription_id,
+                greatest(1, (SELECT quantity FROM subscriptions WHERE id = v_request.subscription_id)
+                    - coalesce((v_request.metadata->>'seats')::integer, 1))
+            );
+        ELSIF v_request.type = 'add_addon' THEN
+            PERFORM add_subscription_addon(
+                v_request.subscription_id, v_request.target_price_id,
+                coalesce((v_request.metadata->>'quantity')::integer, 1)
+            );
+        ELSIF v_request.type = 'remove_addon' THEN
+            PERFORM remove_subscription_addon((v_request.metadata->>'subscription_addon_uid')::uuid);
+        END IF;
+
+        UPDATE subscription_change_requests
+        SET status = 'completed', processed_at = now()
+        WHERE id = v_request.id;
+    EXCEPTION WHEN OTHERS THEN
+        UPDATE subscription_change_requests
+        SET status = 'failed', failure_reason = SQLERRM, processed_at = now()
+        WHERE id = v_request.id;
+        RAISE;
+    END;
+END;
+$$;
+
+-- Bulk-expires change requests that were never applied/paid before their expires_at; mirrors
+-- claim_webhook_events' "reclaim stuck work" pattern but as a plain bulk UPDATE since nothing
+-- needs to be claimed/locked for exclusive processing here.
+CREATE OR REPLACE FUNCTION expire_subscription_change_requests(
+    p_limit integer DEFAULT 100
+)
+RETURNS integer
+LANGUAGE plpgsql
+SET search_path = @extschema@, pg_catalog
+AS $$
+DECLARE
+    v_count integer;
+BEGIN
+    WITH expired AS (
+        SELECT id FROM subscription_change_requests
+        WHERE status IN ('pending', 'processing', 'awaiting_payment')
+          AND expires_at < now()
+        LIMIT p_limit
+    )
+    UPDATE subscription_change_requests
+    SET status = 'expired'
+    WHERE id IN (SELECT id FROM expired);
+
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+    RETURN v_count;
+END;
+$$;
+
+-- ---- Invoicing ----
+
+CREATE OR REPLACE FUNCTION create_invoice(
+    p_customer_id     text,
+    p_currency        text,
+    p_subscription_id uuid        DEFAULT NULL,
+    p_order_id        uuid        DEFAULT NULL,
+    p_billing_reason  text        DEFAULT NULL,
+    p_period_start    timestamptz DEFAULT NULL,
+    p_period_end      timestamptz DEFAULT NULL,
+    p_tenant_id       text        DEFAULT NULL,
+    p_metadata        jsonb       DEFAULT '{}',
+    p_idempotency_key text        DEFAULT NULL
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SET search_path = @extschema@, pg_catalog
+AS $$
+DECLARE
+    v_uid      uuid;
+    v_order    orders;
+    v_subtotal bigint := 0;
+BEGIN
+    IF p_idempotency_key IS NOT NULL THEN
+        SELECT uid INTO v_uid FROM invoices WHERE idempotency_key = p_idempotency_key;
+        IF FOUND THEN
+            RETURN v_uid;
+        END IF;
+    END IF;
+
+    IF p_order_id IS NOT NULL THEN
+        SELECT * INTO v_order FROM orders WHERE id = p_order_id;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'order % not found', p_order_id USING ERRCODE = 'P0002';
+        END IF;
+        v_subtotal := v_order.subtotal_amount;
+    END IF;
+
+    BEGIN
+        INSERT INTO invoices (
+            tenant_id, customer_id, subscription_id, order_id, number,
+            currency, subtotal_amount, total_amount, amount_due,
+            billing_reason, period_start, period_end, metadata, idempotency_key
+        )
+        VALUES (
+            p_tenant_id, p_customer_id, p_subscription_id, p_order_id, next_invoice_number(),
+            p_currency, v_subtotal, v_subtotal, v_subtotal,
+            p_billing_reason::billing_reason, p_period_start, p_period_end, coalesce(p_metadata, '{}'), p_idempotency_key
+        )
+        RETURNING uid INTO v_uid;
+    EXCEPTION WHEN unique_violation THEN
+        SELECT uid INTO v_uid FROM invoices WHERE idempotency_key = p_idempotency_key;
+        RETURN v_uid;
+    END;
+
+    RETURN v_uid;
+END;
+$$;
+
+-- The only sanctioned way to add a billing adjustment line (proration/tax/discount/credit/
+-- usage) to an invoice; recomputes the invoice's totals from its order subtotal plus all of
+-- its line items so amount_due can never drift from what the line items say it should be.
+CREATE OR REPLACE FUNCTION add_invoice_line_item(
+    p_invoice_uid  uuid,
+    p_type         text,
+    p_description  text,
+    p_unit_amount  bigint,
+    p_quantity     numeric     DEFAULT 1,
+    p_period_start timestamptz DEFAULT NULL,
+    p_period_end   timestamptz DEFAULT NULL,
+    p_feature_key  text        DEFAULT NULL,
+    p_metadata     jsonb       DEFAULT '{}'
+)
+RETURNS bigint
+LANGUAGE plpgsql
+SET search_path = @extschema@, pg_catalog
+AS $$
+DECLARE
+    v_invoice      invoices;
+    v_line_item_id bigint;
+    v_order        orders;
+    v_totals       RECORD;
+    v_subtotal     bigint;
+BEGIN
+    SELECT * INTO v_invoice FROM invoices WHERE uid = p_invoice_uid FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'invoice % not found', p_invoice_uid USING ERRCODE = 'P0002';
+    END IF;
+    IF v_invoice.status <> 'draft' THEN
+        RAISE EXCEPTION 'invoice % is %, only a draft invoice accepts line items', p_invoice_uid, v_invoice.status
+            USING ERRCODE = '55000';
+    END IF;
+
+    INSERT INTO invoice_line_items (invoice_id, type, description, quantity, unit_amount, total_amount, period_start, period_end, feature_key, metadata)
+    VALUES (v_invoice.id, p_type, p_description, p_quantity, p_unit_amount, round(p_quantity * p_unit_amount), p_period_start, p_period_end, p_feature_key, coalesce(p_metadata, '{}'))
+    RETURNING id INTO v_line_item_id;
+
+    v_subtotal := 0;
+    IF v_invoice.order_id IS NOT NULL THEN
+        SELECT * INTO v_order FROM orders WHERE id = v_invoice.order_id;
+        v_subtotal := v_order.subtotal_amount;
+    END IF;
+
+    SELECT
+        coalesce(sum(total_amount) FILTER (WHERE type = 'tax'), 0)                                    AS tax,
+        coalesce(sum(total_amount) FILTER (WHERE type = 'discount'), 0) + coalesce(sum(total_amount) FILTER (WHERE type = 'credit'), 0) AS discount,
+        coalesce(sum(total_amount) FILTER (WHERE type IN ('proration', 'usage')), 0)                   AS additions
+    INTO v_totals
+    FROM invoice_line_items
+    WHERE invoice_id = v_invoice.id;
+
+    UPDATE invoices
+    SET subtotal_amount = v_subtotal,
+        tax_amount       = v_totals.tax,
+        discount_amount  = v_totals.discount,
+        total_amount     = v_subtotal + v_totals.tax + v_totals.additions - v_totals.discount,
+        amount_due       = (v_subtotal + v_totals.tax + v_totals.additions - v_totals.discount) - amount_paid
+    WHERE id = v_invoice.id;
+
+    RETURN v_line_item_id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION finalize_invoice(
+    p_invoice_uid uuid,
+    p_due_date    timestamptz DEFAULT NULL
+)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = @extschema@, pg_catalog
+AS $$
+DECLARE
+    v_invoice invoices;
+BEGIN
+    SELECT * INTO v_invoice FROM invoices WHERE uid = p_invoice_uid;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'invoice % not found', p_invoice_uid USING ERRCODE = 'P0002';
+    END IF;
+    IF v_invoice.status <> 'draft' THEN
+        RAISE EXCEPTION 'invoice % is %, only a draft invoice can be finalized', p_invoice_uid, v_invoice.status
+            USING ERRCODE = '55000';
+    END IF;
+
+    UPDATE invoices SET status = 'open', due_date = coalesce(p_due_date, due_date) WHERE id = v_invoice.id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION mark_invoice_paid(
+    p_invoice_uid uuid,
+    p_amount      bigint DEFAULT NULL
+)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = @extschema@, pg_catalog
+AS $$
+DECLARE
+    v_invoice invoices;
+    v_amount  bigint;
+    v_paid    bigint;
+BEGIN
+    SELECT * INTO v_invoice FROM invoices WHERE uid = p_invoice_uid FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'invoice % not found', p_invoice_uid USING ERRCODE = 'P0002';
+    END IF;
+    IF v_invoice.status <> 'open' THEN
+        RAISE EXCEPTION 'invoice % is %, only an open invoice can be paid', p_invoice_uid, v_invoice.status
+            USING ERRCODE = '55000';
+    END IF;
+
+    v_amount := coalesce(p_amount, v_invoice.total_amount - v_invoice.amount_paid);
+    v_paid   := v_invoice.amount_paid + v_amount;
+
+    UPDATE invoices
+    SET amount_paid = v_paid,
+        amount_due  = v_invoice.total_amount - v_paid,
+        status      = CASE WHEN v_paid >= v_invoice.total_amount THEN 'paid'::invoice_status ELSE status END,
+        paid_at     = CASE WHEN v_paid >= v_invoice.total_amount THEN now() ELSE paid_at END
+    WHERE id = v_invoice.id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION void_invoice(
+    p_invoice_uid uuid
+)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = @extschema@, pg_catalog
+AS $$
+DECLARE
+    v_invoice invoices;
+BEGIN
+    SELECT * INTO v_invoice FROM invoices WHERE uid = p_invoice_uid;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'invoice % not found', p_invoice_uid USING ERRCODE = 'P0002';
+    END IF;
+    IF v_invoice.status NOT IN ('draft', 'open') THEN
+        RAISE EXCEPTION 'invoice % is %; a paid invoice must be adjusted with a credit note instead', p_invoice_uid, v_invoice.status
+            USING ERRCODE = '55000';
+    END IF;
+
+    UPDATE invoices SET status = 'void', voided_at = now() WHERE id = v_invoice.id;
+END;
+$$;
+
+-- ---- Credit notes ----
+
+CREATE OR REPLACE FUNCTION issue_credit_note(
+    p_invoice_uid uuid,
+    p_reason      text,
+    p_amount      bigint DEFAULT NULL
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SET search_path = @extschema@, pg_catalog
+AS $$
+DECLARE
+    v_invoice          invoices;
+    v_already_credited bigint;
+    v_amount           bigint;
+    v_uid              uuid;
+BEGIN
+    SELECT * INTO v_invoice FROM invoices WHERE uid = p_invoice_uid FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'invoice % not found', p_invoice_uid USING ERRCODE = 'P0002';
+    END IF;
+    IF v_invoice.status <> 'paid' THEN
+        RAISE EXCEPTION 'invoice % is %, only a paid invoice can receive a credit note', p_invoice_uid, v_invoice.status
+            USING ERRCODE = '55000';
+    END IF;
+
+    SELECT coalesce(sum(total_amount), 0) INTO v_already_credited
+    FROM credit_notes
+    WHERE invoice_id = v_invoice.id AND status = 'issued';
+
+    v_amount := coalesce(p_amount, v_invoice.total_amount - v_already_credited);
+    IF v_amount <= 0 THEN
+        RAISE EXCEPTION 'credit note amount must be positive' USING ERRCODE = '22023';
+    END IF;
+    IF v_already_credited + v_amount > v_invoice.total_amount THEN
+        RAISE EXCEPTION 'credit note of % would exceed invoice % total of % (already credited %)',
+            v_amount, p_invoice_uid, v_invoice.total_amount, v_already_credited USING ERRCODE = '23514';
+    END IF;
+
+    INSERT INTO credit_notes (invoice_id, tenant_id, customer_id, number, status, reason, currency, total_amount)
+    VALUES (v_invoice.id, v_invoice.tenant_id, v_invoice.customer_id, next_credit_note_number(), 'issued', p_reason::credit_note_reason, v_invoice.currency, v_amount)
+    RETURNING uid INTO v_uid;
+
+    RETURN v_uid;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION void_credit_note(
+    p_credit_note_uid uuid
+)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = @extschema@, pg_catalog
+AS $$
+DECLARE
+    v_credit_note credit_notes;
+BEGIN
+    SELECT * INTO v_credit_note FROM credit_notes WHERE uid = p_credit_note_uid;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'credit note % not found', p_credit_note_uid USING ERRCODE = 'P0002';
+    END IF;
+    IF v_credit_note.status <> 'issued' THEN
+        RAISE EXCEPTION 'credit note % is not issued', p_credit_note_uid USING ERRCODE = '55000';
+    END IF;
+
+    UPDATE credit_notes SET status = 'void', voided_at = now() WHERE id = v_credit_note.id;
+END;
+$$;
+
+-- ---- Usage tracking ----
+
+-- Resolves subscription_id from the customer's active subscription when not supplied, then
+-- records the raw event and rolls it into usage_summaries in the same call (an explicit call
+-- here rather than an AFTER INSERT trigger, matching how sync_order_status/sync_account_balance
+-- are invoked explicitly elsewhere in this file rather than via triggers).
+CREATE OR REPLACE FUNCTION record_usage(
+    p_customer_id     text,
+    p_feature_key     text,
+    p_period_start    timestamptz,
+    p_period_end      timestamptz,
+    p_quantity        bigint      DEFAULT 1,
+    p_subscription_id uuid        DEFAULT NULL,
+    p_tenant_id       text        DEFAULT NULL,
+    p_idempotency_key text        DEFAULT NULL,
+    p_metadata        jsonb       DEFAULT '{}'
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SET search_path = @extschema@, pg_catalog
+AS $$
+DECLARE
+    v_feature_id      bigint;
+    v_subscription_id uuid;
+    v_uid             uuid;
+BEGIN
+    IF p_idempotency_key IS NOT NULL THEN
+        SELECT uid INTO v_uid FROM usage_records WHERE idempotency_key = p_idempotency_key;
+        IF FOUND THEN
+            RETURN v_uid;
+        END IF;
+    END IF;
+
+    SELECT id INTO v_feature_id FROM features WHERE key = p_feature_key;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'feature % not found', p_feature_key USING ERRCODE = 'P0002';
+    END IF;
+
+    v_subscription_id := p_subscription_id;
+    IF v_subscription_id IS NULL THEN
+        SELECT id INTO v_subscription_id
+        FROM subscriptions
+        WHERE customer_id = p_customer_id
+          AND status IN ('active', 'trialing')
+        ORDER BY created_at DESC
+        LIMIT 1;
+    END IF;
+
+    BEGIN
+        INSERT INTO usage_records (subscription_id, feature_id, feature_key, quantity, period_start, period_end, idempotency_key, metadata)
+        VALUES (v_subscription_id, v_feature_id, p_feature_key, p_quantity, p_period_start, p_period_end, p_idempotency_key, coalesce(p_metadata, '{}'))
+        RETURNING uid INTO v_uid;
+    EXCEPTION WHEN unique_violation THEN
+        SELECT uid INTO v_uid FROM usage_records WHERE idempotency_key = p_idempotency_key;
+        RETURN v_uid;
+    END;
+
+    IF v_subscription_id IS NOT NULL THEN
+        INSERT INTO usage_summaries (subscription_id, feature_id, feature_key, period_start, period_end, total_quantity, last_updated_at)
+        VALUES (v_subscription_id, v_feature_id, p_feature_key, p_period_start, p_period_end, p_quantity, now())
+        ON CONFLICT (subscription_id, feature_id, period_start, period_end) DO UPDATE
+            SET total_quantity  = usage_summaries.total_quantity + EXCLUDED.total_quantity,
+                last_updated_at = now();
+    END IF;
+
+    RETURN v_uid;
 END;
 $$;
 
