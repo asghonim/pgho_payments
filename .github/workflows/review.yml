@@ -1,0 +1,17 @@
+name: Review
+
+on:
+  pull_request:
+
+permissions:
+  id-token: write # Required for requesting the JWT OIDC token
+  contents: read
+
+jobs:
+  claude:
+    name: Claude Review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Claude Code Action Official
+        uses: anthropics/claude-code-action@v1
+      
